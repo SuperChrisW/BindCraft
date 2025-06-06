@@ -1,0 +1,9 @@
+{
+    "design_path": "./IL23_traj2/",
+    "binder_name": "IL23",
+    "starting_pdb": "./example/IL23_target.pdb",
+    "chains": "B",
+    "target_hotspot_residues": "51-61,151-161",
+    "lengths": [30,80],
+    "number_of_final_designs": 500
+}
