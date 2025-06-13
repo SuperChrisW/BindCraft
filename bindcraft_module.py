@@ -13,7 +13,7 @@ from typing import Any, Dict, Tuple
 from functions.biopython_utils import *
 from functions.pyrosetta_utils import *
 from functions.generic_utils import *
-from functions.colabdesign_utils_revised import *
+from functions.colabdesign_utils import *
 
 import logging
 
@@ -25,7 +25,7 @@ logging.basicConfig(
     level=logging.INFO
 )
 init_logger.setLevel(logging.INFO)
-design_logger.setLevel(logging.DEBUG)
+design_logger.setLevel(logging.INFO)
 
 def build_design_name(target_settings: Dict[str, Any], length: int, seed: int) -> str:
     """
@@ -244,7 +244,7 @@ class Scorer:
         self.design_paths = ws.design_paths
         self.traj_info = ws.traj_info
 
-    def score_traj(self, traj, traj_pdb, traj_relaxed, traj_metrics, binder_chain="B"):
+    def score_traj(self, traj_seq, traj_pdb, traj_relaxed, traj_metrics, binder_chain="B"):
         # Calculate clashes before and after relaxation
         num_clashes_trajectory = calculate_clash_score(traj_pdb)
         num_clashes_relaxed = calculate_clash_score(traj_relaxed)
@@ -258,10 +258,10 @@ class Scorer:
         traj_interface_scores, traj_interface_AA, traj_interface_residues = score_interface(traj_relaxed, binder_chain)
 
         # starting binder sequence
-        traj_seq = traj.get_seq(get_best=True)[0]
+        #traj_seq = traj.get_seq(get_best=True)[0]
 
         # analyze sequence
-        traj_seq_notes = validate_design_sequence(traj_seq, num_clashes_relaxed, self.settings[''])
+        traj_seq_notes = validate_design_sequence(traj_seq, num_clashes_relaxed, self.advanced_settings)
 
         # target structure RMSD compared to input PDB
         traj_target_rmsd = target_pdb_rmsd(traj_pdb, self.target_settings["starting_pdb"], self.target_settings["chains"])
@@ -277,11 +277,12 @@ class Scorer:
                 "InterfaceResidues": traj_interface_residues,
 
                 # following keys are used in mpnn statistics
-                "pLDDT": traj_metrics['plddt'],
-                "pTM": traj_metrics['ptm'],
-                "i_pTM": traj_metrics['i_ptm'],
-                "pAE": traj_metrics['pae'],
-                "i_pAE": traj_metrics['i_pae'],
+                "pLDDT": traj_metrics.get('plddt', None),
+                "pTM": traj_metrics.get('ptm', None),
+                "i_pTM": traj_metrics.get('i_ptm', None),
+                "pAE": traj_metrics.get('pae', None),
+                "i_pAE": traj_metrics.get('i_pae', None),
+
                 "i_pLDDT": traj_i_plddt,
                 "ss_pLDDT": traj_ss_plddt,
                 "Unrelaxed_Clashes": num_clashes_trajectory,
@@ -335,10 +336,10 @@ class BinderDesign:
         self.mpnn_dict = {}
         self.design_start_time = None
 
-        self.statistics_labels = ['pLDDT', 'pTM', 'i_pTM', 'pAE', 'i_pAE', 'i_pLDDT', 'ss_pLDDT', 'Unrelaxed_Clashes', 'Relaxed_Clashes', 'Binder_Energy_Score', 'Surface_Hydrophobicity',
-                                'ShapeComplementarity', 'PackStat', 'dG', 'dSASA', 'dG/dSASA', 'Interface_SASA_%', 'Interface_Hydrophobicity', 'n_InterfaceResidues', 'n_InterfaceHbonds', 'InterfaceHbondsPercentage',
-                                'n_InterfaceUnsatHbonds', 'InterfaceUnsatHbondsPercentage', 'Interface_Helix%', 'Interface_BetaSheet%', 'Interface_Loop%', 'Binder_Helix%',
-                                'Binder_BetaSheet%', 'Binder_Loop%', 'InterfaceAAs', 'Hotspot_RMSD', 'Target_RMSD']
+        self.statistics_labels = statistics_labels = ['pLDDT', 'pTM', 'i_pTM', 'pAE', 'i_pAE', 'i_pLDDT', 'ss_pLDDT', 'Unrelaxed_Clashes', 'Relaxed_Clashes', 'Binder_Energy_Score', 'Surface_Hydrophobicity',
+                                            'ShapeComplementarity', 'PackStat', 'dG', 'dSASA', 'dG/dSASA', 'Interface_SASA_%', 'Interface_Hydrophobicity', 'n_InterfaceResidues', 'n_InterfaceHbonds', 'InterfaceHbondsPercentage',
+                                            'n_InterfaceUnsatHbonds', 'InterfaceUnsatHbondsPercentage', 'Interface_Helix%', 'Interface_BetaSheet%', 'Interface_Loop%', 'Binder_Helix%',
+                                            'Binder_BetaSheet%', 'Binder_Loop%', 'InterfaceAAs', 'Hotspot_RMSD', 'Target_RMSD']
 
     def hallucinate(self, design_name: str, length: int, seed: int, helicity_value) -> Any:
         """
@@ -376,7 +377,7 @@ class BinderDesign:
         length = ws.traj_info["length"]
 
         ### MPNN redesign of starting binder
-        mpnn_traj = mpnn_gen_sequence(traj_pdb, ws.traj_info['binder_chain'], ws.traj_data["trajectory_interface_residues"], ws.advanced_settings)
+        mpnn_traj = mpnn_gen_sequence(traj_pdb, ws.traj_info['binder_chain'], ws.traj_data["InterfaceResidues"], ws.advanced_settings)
         existing_mpnn_sequences = set(pd.read_csv(ws.csv_paths["mpnn_csv"], usecols=['Sequence'])['Sequence'].values)
         
         # create set of MPNN sequences with allowed amino acid composition
@@ -404,7 +405,7 @@ class BinderDesign:
                 mpnn_time = time.time()
 
                 # generate mpnn design name numbering
-                mpnn_design_name = ws.traj_data["name"] + "_mpnn" + str(self.mpnn_n)
+                mpnn_design_name = ws.traj_data["design_name"] + "_mpnn" + str(self.mpnn_n)
                 mpnn_score = round(mpnn_sequence['score'],2)
                 mpnn_seqid = round(mpnn_sequence['seqid'],2)
 
@@ -416,7 +417,7 @@ class BinderDesign:
                 
                 mpnn_complex_statistics, pass_af2_filters = predict_binder_complex(complex_prediction_model,
                                                                                     mpnn_sequence['seq'], mpnn_design_name, ws.target_settings['starting_pdb'], 
-                                                                                    ws.traj_info["chains"],ws.traj_info["length"], traj_pdb, ws.traj_info["prediction_models"], ws.advanced_settings,
+                                                                                    ws.target_settings["chains"],ws.traj_info["length"], traj_pdb, ws.traj_info["prediction_models"], ws.advanced_settings,
                                                                                     ws.filters_settings, ws.design_paths, ws.csv_paths["failure_csv"])
 
                 # if AF2 filters are not passed then skip the scoring
@@ -431,10 +432,13 @@ class BinderDesign:
                     mpnn_design_relaxed = os.path.join(ws.design_paths["MPNN/Relaxed"], f"{mpnn_design_name}_model{model_num+1}.pdb")
 
                     # score the design
-                    mpnn_design_scores = scorer.score_traj(mpnn_design_relaxed, mpnn_design_pdb, mpnn_design_relaxed, mpnn_complex_statistics, ws.traj_info["binder_chain"])
+                    mpnn_design_scores = scorer.score_traj(mpnn_sequence['seq'], mpnn_design_pdb, mpnn_design_relaxed, 
+                                                    {}, ws.traj_info["binder_chain"]) # leave empty dict here, generate None value for ['pLDDT', 'pTM', 'i_pTM', 'pAE', 'i_pAE'] keys
+                    
                     rmsd_site = unaligned_rmsd(traj_pdb, mpnn_design_pdb, ws.traj_info["binder_chain"], ws.traj_info["binder_chain"])
                     mpnn_design_scores['Hotspot_RMSD'] = rmsd_site
-                    mpnn_design_scores = {k:v for k,v in mpnn_design_scores.items() if k in self.statistics_labels}
+                    mpnn_design_scores = {k:v for k,v in mpnn_design_scores.items() if k in self.statistics_labels[5:]} # first 5 keys will updated later ['pLDDT', 'pTM', 'i_pTM', 'pAE', 'i_pAE']
+                    design_logger.debug(f'MPNN design {mpnn_design_name} model {model_num+1} scores: {mpnn_design_scores}')
                     
                     # add the additional statistics to the mpnn_complex_statistics dictionary
                     mpnn_complex_statistics[model_num+1].update(mpnn_design_scores)
@@ -476,10 +480,10 @@ class BinderDesign:
 
                 model_numbers = range(1, 6)
                 mpnn_data = [mpnn_design_name, ws.advanced_settings["design_algorithm"], length, ws.traj_info["seed"], ws.traj_info["helicity_value"], 
-                             ws.target_settings["target_hotspot_residues"], mpnn_sequence['seq'], ws.traj_data["trajectory_interface_residues"], mpnn_score, mpnn_seqid]
+                             ws.target_settings["target_hotspot_residues"], mpnn_sequence['seq'], ws.traj_data["InterfaceResidues"], mpnn_score, mpnn_seqid]
 
                 for label in self.statistics_labels:
-                    mpnn_data.append(mpnn_complex_statistics.get(label, None))
+                    mpnn_data.append(mpnn_complex_averages.get(label, None))
                     for model in model_numbers:
                         mpnn_data.append(mpnn_complex_statistics.get(model, {}).get(label, None))
                 
@@ -512,13 +516,13 @@ class BinderDesign:
 
                     # copy animation from accepted trajectory
                     if ws.advanced_settings["save_design_animations"]:
-                        accepted_animation = os.path.join(ws.design_paths["Accepted/Animation"], f"{ws.traj_info['design_name']}.html")
+                        accepted_animation = os.path.join(ws.design_paths["Accepted/Animation"], f"{ws.traj_info['name']}.html")
                         if not os.path.exists(accepted_animation):
-                            shutil.copy(os.path.join(ws.design_paths["Trajectory/Animation"], f"{ws.traj_info['design_name']}.html"), accepted_animation)
+                            shutil.copy(os.path.join(ws.design_paths["Trajectory/Animation"], f"{ws.traj_info['name']}.html"), accepted_animation)
 
                     # copy plots of accepted trajectory
                     plot_files = os.listdir(ws.design_paths["Trajectory/Plots"])
-                    plots_to_copy = [f for f in plot_files if f.startswith(ws.traj_info['design_name']) and f.endswith('.png')]
+                    plots_to_copy = [f for f in plot_files if f.startswith(ws.traj_info['name']) and f.endswith('.png')]
                     for accepted_plot in plots_to_copy:
                         source_plot = os.path.join(ws.design_paths["Trajectory/Plots"], accepted_plot)
                         target_plot = os.path.join(ws.design_paths["Accepted/Plots"], accepted_plot)
@@ -546,7 +550,7 @@ class BinderDesign:
                 self.mpnn_n += 1
 
                 if self.accepted_mpnn >= ws.advanced_settings["max_mpnn_sequences"]:
-                    design_logger.debug(f"Max MPNN designs reached for {ws.traj_info['design_name']}, skipping to next trajectory.")
+                    design_logger.debug(f"Max MPNN designs reached for {ws.traj_info['name']}, skipping to next trajectory.")
                     break
 
             if self.accepted_mpnn >= 1:
@@ -561,14 +565,13 @@ class BinderDesign:
             os.remove(traj_pdb)
         design_time = time.time() - self.design_start_time
         design_time_text = f"{'%d hours, %d minutes, %d seconds' % (int(design_time // 3600), int((design_time % 3600) // 60), int(design_time % 60))}"
-        design_logger.info(f"Design and validation of trajectory {ws.traj_info['design_name']} took: {design_time_text}")
+        design_logger.info(f"Design and validation of trajectory {ws.traj_info['name']} took: {design_time_text}")
 
         return self.accepted_mpnn
 
     def prediction_models_prep(self, ws: Workspace, traj_pdb: str) -> Tuple[Any, Any]:
-
         # add optimisation for increasing recycles if trajectory is beta sheeted
-        if ws.advanced_settings["optimise_beta"] and float(ws.traj_data["trajectory_beta"]) > 15:
+        if ws.advanced_settings["optimise_beta"] and float(ws.traj_data["Binder_BetaSheet%"]) > 15:
             ws.advanced_settings["num_recycles_validation"] = ws.advanced_settings["optimise_beta_recycles_valid"]
         
         clear_mem()
@@ -673,7 +676,6 @@ class BindCraftPipeline:
         # Components
         criteria = TerminationCriteria(ws.settings['advanced_settings'])
         artifact = ArtifactHandler(ws.design_paths, ws.settings, ws.csv_paths)
-        scorer = Scorer(ws) # initialize pyrosetta or other scoring tools here
         designer = BinderDesign(self.design_models, ws.settings, ws.design_paths, ws.csv_paths)
         # initialize pyrosetta
         pr.init(f'-ignore_unrecognized_res -ignore_zero_occupancy -mute all -holes:dalphaball {ws.advanced_settings["dalphaball_path"]} -corrections::beta_nov16 true -relax:default_repeats 1')
@@ -719,6 +721,7 @@ class BindCraftPipeline:
                 "mutlimer_validation": self.multimer_validation,
                 "design_models": self.design_models
             }
+            traj_scorer = Scorer(ws)
 
             traj_metrics = copy_dict(traj._tmp["best"]["aux"]["log"]) # contains plddt, ptm, i_ptm, pae, i_pae
             traj_pdb = os.path.join(ws.design_paths["Trajectory"], name + ".pdb")
@@ -734,13 +737,13 @@ class BindCraftPipeline:
                 pr_relax(traj_pdb, traj_relaxed)
 
                 design_logger.debug(f"Scoring trajectory {name}.")
-                ws.traj_data = scorer.score_traj(traj, traj_pdb, traj_relaxed, traj_metrics, ws.traj_info["binder_chain"])
+                ws.traj_data = traj_scorer.score_traj(traj.get_seq(get_best=True)[0], traj_pdb, traj_relaxed, traj_metrics, ws.traj_info["binder_chain"])
                 
                 insert_data(ws.csv_paths["trajectory_csv"], ws.traj_data.values())
                 design_logger.debug(f"Scored trajectory {name}, proceeding to MPNN if enabled.")
 
                 if ws.advanced_settings["enable_mpnn"]:
-                    accepted_mpnn = designer.mpnn_design(ws, scorer, traj_pdb)
+                    accepted_mpnn = designer.mpnn_design(ws, traj_scorer, traj_pdb)
                     self.accepted += accepted_mpnn
                     design_logger.debug(f"MPNN design for {name} complete. accepted_mpnn={accepted_mpnn}, total accepted={self.accepted}")
 
@@ -752,10 +755,9 @@ class BindCraftPipeline:
             else:
                 design_logger.debug(f"Trajectory {name} terminated early due to {traj.aux['log']['terminate']}, skipping.")
 
+            design_logger.debug(f"End of trajectory loop iteration. trajectory_n={self.trajectory_n}")
             self.trajectory_n += 1
             gc.collect()
-
-            design_logger.debug(f"End of trajectory loop iteration. trajectory_n={self.trajectory_n}")
 
 def main():
     initializer = Initialization()
