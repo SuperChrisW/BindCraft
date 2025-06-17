@@ -317,7 +317,11 @@ class Scorer:
                 "filters_file": self.filters_path,
                 "advanced_file": self.advanced_path
             }
-
+    
+    def score_mpnn(self, mpnn_data, design_labels, filters):
+        # check mpnn_data against labels
+        mpnn_dict = {label: value for label, value in zip(design_labels, mpnn_data)}
+        
 class BinderDesign:
     def __init__(self, design_models: Any, settings: Dict[str, Any], design_paths: Dict[str, str], csv_paths: Dict[str,str]):
         self.design_models = design_models
@@ -594,7 +598,21 @@ class BinderDesign:
         binder_prediction_model.prep_inputs(length=ws.traj_info["length"])
         
         return complex_prediction_model, binder_prediction_model
-        
+    
+    def rfdiffusion_design(self, mpnn_data, design_labels, filters):
+        raise NotImplementedError("RFdiffusion design not implemented yet")
+    
+    def dlpm_design(self, mpnn_data, design_labels, filters):
+        raise NotImplementedError("DLPM design not implemented yet")
+    
+    def hallucinate_scaffolding(self, mpnn_data, design_labels, filters):
+        raise NotImplementedError("Scaffolding design not implemented yet")
+
+    def rfdiffusion_scaffolding(self, mpnn_data, design_labels, filters):
+        raise NotImplementedError("RFdiffusion scaffolding design not implemented yet")
+    
+    def dlpm_scaffolding(self, mpnn_data, design_labels, filters):
+        raise NotImplementedError("DLPM scaffolding design not implemented yet")
 
 class ArtifactHandler:
     def __init__(self, design_paths: Dict[str, str], settings: Dict[str, Any], csv_paths: Dict[str, str]) -> None:
@@ -721,7 +739,7 @@ class BindCraftPipeline:
                 "mutlimer_validation": self.multimer_validation,
                 "design_models": self.design_models
             }
-            traj_scorer = Scorer(ws)
+            traj_scorer = Scorer(ws) # refresh scorer.traj_info in every trajectory
 
             traj_metrics = copy_dict(traj._tmp["best"]["aux"]["log"]) # contains plddt, ptm, i_ptm, pae, i_pae
             traj_pdb = os.path.join(ws.design_paths["Trajectory"], name + ".pdb")
