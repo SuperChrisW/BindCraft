@@ -1,6 +1,7 @@
 import os
 import shutil
 import argparse
+import time
 import glob
 import pandas as pd
 import numpy as np
@@ -11,6 +12,8 @@ from Bio.PDB import PDBParser, PPBuilder
 
 from colabdesign import clear_mem
 from colabdesign.mpnn import mk_mpnn_model
+from functions.generic_utils import create_dataframe, insert_data
+from functions.biopython_utils import hotspot_residues
 
 import logging
 
@@ -76,6 +79,7 @@ class MPNNHandler:
         pass
 
     def get_mpnn_score(self, pdb_path: str, ws, pdb_handler, binder_chain='B') -> float:
+        score_start_time = time.time()
         clear_mem()
 
         logger.info(f"Processing PDB file: {pdb_path}")
@@ -88,29 +92,44 @@ class MPNNHandler:
         mpnn_model = mk_mpnn_model(backbone_noise=ws.advanced_settings["backbone_noise"], model_name=ws.advanced_settings["model_path"], weights=ws.advanced_settings["mpnn_weights"])
         design_chains = 'A,B'
 
-        traj_interface_scores, traj_interface_AA, traj_interface_residues = score_interface(pdb_path, binder_chain=binder_chain)
+        traj_interface_residues = []
+        interface_residues_set = hotspot_residues(pdb_path, binder_chain=binder_chain, atom_distance_cutoff=4.0)
+        for pdb_res_num, aa_type in interface_residues_set.items():
+            traj_interface_residues.append(f"{binder_chain}{pdb_res_num}")
+        traj_interface_residues = ','.join(traj_interface_residues)
+
         if ws.advanced_settings["mpnn_fix_interface"]:
             fixed_positions = 'A,' + traj_interface_residues
             fixed_positions = fixed_positions.rstrip(",")
-            print("Fixing interface residues: "+traj_interface_residues)
+            print("Fixing interface residues: "+ traj_interface_residues)
         else:
             fixed_positions = 'A'
-
+        
+        #fixed_positions = 'A'  # Fixing only chain A, as per the original code
         # prepare inputs for MPNN
         mpnn_model.prep_inputs(pdb_filename=dest_pdb, chain=design_chains, fix_pos=fixed_positions, rm_aa=ws.advanced_settings["omit_AAs"])
 
         # sample MPNN sequences in parallel
         mpnn_sequences = mpnn_model.sample(temperature=ws.advanced_settings["sampling_temp"], num=1, batch=ws.advanced_settings["num_seqs"])
-        mpnn_seq_data = {
-            'seq': [mpnn_sequences['seq'][i][-length:] for i in range(ws.advanced_settings["num_seqs"])], 
-            'score': [mpnn_sequences['score'][i] for i in range(ws.advanced_settings["num_seqs"])], 
+        # Store the MPNN score and sequence into CSV using insert_data
+        # Prepare a dictionary for each sequence/score pair and insert into CSV
+        for i in range(ws.advanced_settings["num_seqs"]):
+            row_data = {
+                "Design": name,
+                "MPNN_id": f"_mpnn{i}",
+                "Sequence": mpnn_sequences['seq'][i][-length:],
+                "MPNN_score": mpnn_sequences['score'][i],
+                "InterfaceResidues": traj_interface_residues,
             }
-        
-        return np.mean(mpnn_seq_data['score'])
+            # Insert into the MPNN CSV file
+            insert_data(ws.csv_paths["mpnn_bb_score_stats"], row_data)
+        logger.info(f"MPNN scoring time: {time.time() - score_start_time:.2f} seconds")
+        return np.mean([mpnn_sequences['score'][i] for i in range(ws.advanced_settings["num_seqs"])])
 
 class CustomPipeline:
     def __init__(self):
         self.cfg = None
+        self.pipeline_start_time = time.time()
     
     def parse_args(self):
         parser = argparse.ArgumentParser(description='BindCraft pipeline from pre-generated PDBs (skip hallucination).')
@@ -148,6 +167,12 @@ class CustomPipeline:
         ws = Workspace(self.cfg)
         ws.setup()
         ws.init_dataframes()
+        
+        # initiate a new bb score csv file
+        ws.settings["mpnn_bb_labels"] = ['Design', 'MPNN_id', 'Sequence', 'MPNN_score', 'InterfaceResidues']
+        mpnn_bb_score_csv = os.path.join(ws.target_settings["design_path"], "mpnn_bb_score_stats.csv")
+        ws.csv_paths["mpnn_bb_score_stats"] = mpnn_bb_score_csv
+        create_dataframe(ws.csv_paths["mpnn_bb_score_stats"], ws.settings["mpnn_bb_labels"])
         logger.info(f"Workspace setup complete.")
 
         designer = BinderDesign(self.cfg["design_models"], ws.settings, ws.design_paths, ws.csv_paths)
@@ -229,11 +254,14 @@ def main():
     # customize loop
     for pdb_path in pdb_files:
         #accepted += pipeline.run_PDB_redesign(pdb_path, ws, designer, pdb_handler)
+        basename = os.path.basename(pdb_path).replace('.pdb', '')
         score = mpnn_handler.get_mpnn_score(pdb_path, ws, pdb_handler)
-        print(f"for PDB {os.path.basename(pdb_path)}, MPNN score: {score}")
+        print(f"for PDB {basename}, MPNN score: {score}")
 
     #artifact.rerank_designs()
     #print(f"Pipeline complete. Total accepted MPNN designs: {accepted}")
+    pipeline.end_time = time.time()
+    logger.info(f"Pipeline complete. Total time: {pipeline.end_time - pipeline.pipeline_start_time:.2f} seconds")
 
 if __name__ == "__main__":
     main() 
