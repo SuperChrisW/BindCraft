@@ -135,17 +135,18 @@ three_to_one_map = {
 }
 
 # identify interacting residues at the binder interface
-def hotspot_residues(trajectory_pdb, target_chain="A", binder_chain="B", atom_distance_cutoff=4.0):
+def hotspot_residues(trajectory_pdb, target_chain="A", binder_chain="B", atom_distance_cutoff=4.0, only_ca=False):
     # Parse the PDB file
     parser = PDBParser(QUIET=True)
     structure = parser.get_structure("complex", trajectory_pdb)
 
     # Get the specified chain
     binder_atoms = Selection.unfold_entities(structure[0][binder_chain], 'A')
-    binder_coords = np.array([atom.coord for atom in binder_atoms])
-
-    # Get atoms and coords for the target chain
     target_atoms = Selection.unfold_entities(structure[0][target_chain], 'A')
+    if only_ca:
+        binder_atoms = [atom for atom in binder_atoms if atom.get_name() == 'CA']
+        target_atoms = [atom for atom in target_atoms if atom.get_name() == 'CA']
+    binder_coords = np.array([atom.coord for atom in binder_atoms])
     target_coords = np.array([atom.coord for atom in target_atoms])
 
     # Build KD trees for both chains
@@ -190,7 +191,7 @@ def calc_ss_percentage(pdb_file, advanced_settings, chain_id="B", atom_distance_
 
     # Get chain and interacting residues once
     chain = model[chain_id]
-    interacting_residues = set(hotspot_residues(pdb_file, chain_id, atom_distance_cutoff).keys())
+    interacting_residues = set(hotspot_residues(pdb_file, binder_chain=chain_id, atom_distance_cutoff=atom_distance_cutoff).keys())
 
     for residue in chain:
         residue_id = residue.id[1]
