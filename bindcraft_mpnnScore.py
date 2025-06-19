@@ -74,11 +74,12 @@ class PDBHandler:
                     return ''.join(seqs)
         return ''
 
+# MPNN functions 
 class MPNNHandler:
     def __init__(self):
         pass
 
-    def get_mpnn_score(self, pdb_path: str, ws, pdb_handler, binder_chain='B') -> float:
+    def get_mpnn_score(self, pdb_path: str, ws: Workspace, pdb_handler: PDBHandler, binder_chain='B') -> float:
         score_start_time = time.time()
         clear_mem()
 
@@ -105,14 +106,10 @@ class MPNNHandler:
         else:
             fixed_positions = 'A'
         
-        #fixed_positions = 'A'  # Fixing only chain A, as per the original code
-        # prepare inputs for MPNN
         mpnn_model.prep_inputs(pdb_filename=dest_pdb, chain=design_chains, fix_pos=fixed_positions, rm_aa=ws.advanced_settings["omit_AAs"])
 
         # sample MPNN sequences in parallel
         mpnn_sequences = mpnn_model.sample(temperature=ws.advanced_settings["sampling_temp"], num=1, batch=ws.advanced_settings["num_seqs"])
-        # Store the MPNN score and sequence into CSV using insert_data
-        # Prepare a dictionary for each sequence/score pair and insert into CSV
         for i in range(ws.advanced_settings["num_seqs"]):
             row_data = {
                 "Design": name,
@@ -121,10 +118,23 @@ class MPNNHandler:
                 "MPNN_score": mpnn_sequences['score'][i],
                 "InterfaceResidues": traj_interface_residues,
             }
-            # Insert into the MPNN CSV file
             insert_data(ws.csv_paths["mpnn_bb_score_stats"], row_data)
         logger.info(f"MPNN scoring time: {time.time() - score_start_time:.2f} seconds")
         return np.mean([mpnn_sequences['score'][i] for i in range(ws.advanced_settings["num_seqs"])])
+
+    def select_topBB_design(self, ws, top_N: int = 200) -> pd.DataFrame:
+        BB_df = pd.read_csv(ws.csv_paths["mpnn_bb_score_stats"])
+        BB_grouped = BB_df.groupby("Design")["MPNN_score"].mean().reset_index()
+        BB_grouped_sorted = BB_grouped.sort_values(by="MPNN_score", ascending=True)
+        top_designs = BB_grouped_sorted.head(top_N)
+        
+        representative_designs = BB_df[BB_df["Design"].isin(top_designs["Design"])]
+        # For each group, pick the top-ranked entry as the representative design
+        final_grouped_table = representative_designs.groupby("Design").apply(
+            lambda x: x.nsmallest(1, "MPNN_score")
+        ).reset_index(drop=True)
+        
+        return final_grouped_table
 
 class CustomPipeline:
     def __init__(self):
@@ -145,6 +155,8 @@ class CustomPipeline:
                             help='Path to the advanced.json file with additional design settings.')
         parser.add_argument('--cuda', type=str, default='0',
                             help='define the GPU devices')
+        parser.add_argument('--opt_cycles', type=int, default=1,
+                            help='Number of relax-MPNN optimization cycles to perform (default: 1)')
         args = parser.parse_args()
 
         os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda
@@ -199,43 +211,136 @@ class CustomPipeline:
         scorer = Scorer(ws)
         return scorer
 
-    def run_PDB_redesign(self, pdb_path, ws, designer, pdb_handler):
+    def select_best_mpnn_design(self, cycle_results):
+        """
+        Select the best MPNN design from the current cycle for the next iteration.
+        """
+        best_designs = None
+        best_score = float('-inf')
+        for key, mpnn_dict in cycle_results['mpnn_data'].items():
+            plddt_scores = mpnn_dict.get('plddt_score', [])
+            if not plddt_scores:
+                continue
+            max_score = max(plddt_scores)
+            indices = [i for i, s in enumerate(plddt_scores) if s == max_score]
+            if max_score > best_score:
+                best_score = max_score
+                best_designs = [(key, i) for i in indices]
+
+        if best_designs:
+            key, idx = best_designs[0]
+            return os.path.abspath(cycle_results['mpnn_data'][key]['relaxed_pdb'][idx])
+        else:
+            return None
+
+    def run_PMPNN_redesign(self, pdb_path, ws, designer, pdb_handler, opt_cycles=1, num_mpnn_sample = 20, binder_chain = 'B'):
         '''
-        This function is used to redesign a PDB file using BindCraft pipeline.
-        It will:
+        This function is used to redesign a PDB file using BindCraft pipeline with iterative optimization.
+        
+        The workflow performs multiple relax-MPNN cycles:
         1. Copy the PDB file to the trajectory directory
-        2. Relax the trajectory
-        3. Score the trajectory
-        4. MPNN redesign the trajectory (keep interface residues while redesign the rest)
-        return the number of accepted designs
+        2. For each optimization cycle:
+           a. Relax the trajectory (structure optimization)
+           b. Score the trajectory (evaluate current state)
+           c. MPNN redesign the trajectory (sequence optimization while keeping interface residues fixed)
+           d. Select best design for next cycle (if available)
+        
+        Args:
+            pdb_path: Path to input PDB file, defaultly use the top-ranked backbone design from the initial MPNN sampling
+            ws: Workspace object
+            designer: BinderDesign object
+            pdb_handler: PDBHandler object
+            opt_cycles: Number of relax-MPNN optimization cycles to perform (default: 1)
+        
+        Returns:
+            int: Total number of accepted MPNN designs across all cycles
         '''
-        logger.info(f"Processing PDB file: {pdb_path}")
+        logger.info(f"Processing PDB file: {pdb_path} with {opt_cycles} optimization cycles")
         name = os.path.splitext(os.path.basename(pdb_path))[0]
+        if not pdb_path.endswith('.pdb'):
+            pdb_path += '.pdb'
         dest_pdb = os.path.join(ws.design_paths["Trajectory"], f"{name}.pdb")
-        shutil.copy(pdb_path, dest_pdb)
+        
+        if os.path.abspath(pdb_path) != os.path.abspath(dest_pdb):  # Check to avoid copying the same file
+            shutil.copy(pdb_path, dest_pdb)
 
-        # Relax
-        relaxed_pdb = os.path.join(ws.design_paths["Trajectory/Relaxed"], f"{name}.pdb")
-        pr_relax(dest_pdb, relaxed_pdb)
-        logger.info(f"Finished relaxing trajectory")
-
-        # Score
-        binder_chain = 'B'
         length = pdb_handler.infer_length_from_pdb(dest_pdb, binder_chain)
         seq = pdb_handler.get_sequence_from_pdb(dest_pdb, binder_chain)
         scorer = self.update_traj_info(ws, name, binder_chain, length)
-        traj_metrics = {}  # No AF2 metrics, so leave empty
-        ws.traj_data = scorer.score_traj(seq, dest_pdb, relaxed_pdb, traj_metrics, binder_chain)
-        logger.info(f"Finished scoring trajectory")
-        insert_data(ws.csv_paths["trajectory_csv"], ws.traj_data.values())
-
-        # MPNN redesign
+        
         accepted_mpnn = 0
-        if ws.advanced_settings["enable_mpnn"]:
-            logger.info(f"Starting MPNN redesign")
-            accepted_mpnn = designer.mpnn_design(ws, scorer, dest_pdb)
-            accepted += accepted_mpnn
-            logger.info(f"Finished MPNN redesign: {accepted_mpnn} designs accepted")
+        current_pdb = dest_pdb
+        cycle_results = []
+
+        logger.info(f"Starting iterative optimization with {opt_cycles} cycles")
+        for cycle in range(opt_cycles):
+            logger.info(f"=== Optimization Cycle {cycle + 1}/{opt_cycles} ===")
+            scorer = self.update_traj_info(ws, f"{name}_cycle{cycle}", binder_chain, length, seed=0, helicity_value=None, traj_time_text=f"Cycle {cycle + 1}")
+
+            # Step 1: Relax - Structure optimization
+            relaxed_pdb = os.path.join(ws.design_paths["Trajectory/Relaxed"], f"{name}_cycle{cycle}.pdb")
+            logger.info(f"Step 1: Relaxing structure from {os.path.basename(current_pdb)}")
+            pr_relax(current_pdb, relaxed_pdb)
+            logger.info(f"✓ Relaxation complete: {os.path.basename(relaxed_pdb)}")
+
+            # Step 2: Score - Evaluate current state
+            logger.info(f"Step 2: Scoring relaxed structure")
+            traj_metrics = {}  # No AF2 metrics, so leave empty
+            ws.traj_data = scorer.score_traj(seq, current_pdb, relaxed_pdb, traj_metrics, binder_chain)
+            insert_data(ws.csv_paths["trajectory_csv"], ws.traj_data.values())
+            logger.info(f"✓ Scoring complete")
+
+            # Step 3: MPNN redesign - Sequence optimization
+            cycle_accepted = 0
+            if ws.advanced_settings["enable_mpnn"]:
+                logger.info(f"Step 3: MPNN sequence redesign")
+                ws.advanced_settings['num_seqs'] = num_mpnn_sample 
+                cycle_accepted, mpnn_dict = designer.mpnn_design(ws, scorer, relaxed_pdb)
+                #note: relaxed traj pdb will be removed in set in advanced_settings
+                accepted_mpnn += cycle_accepted
+                logger.info(f"✓ MPNN redesign complete: {cycle_accepted} designs accepted")
+                
+                # Store cycle results for potential selection of best design
+                cycle_results.append({
+                    'cycle': cycle + 1,
+                    'relaxed_pdb': relaxed_pdb,
+                    'accepted_designs': cycle_accepted,
+                    'mpnn_data': mpnn_dict,
+                })
+                
+                # Update current_pdb to the best MPNN design for next cycle
+                if cycle_accepted > 0:
+                    # if multiple mpnn designs returned, pick the best one based on plddt score and return pdb file path
+                    best_design = self.select_best_mpnn_design(cycle_results[-1]) # pick design from the last cycle
+                    if best_design:
+                        current_pdb = best_design
+                        logger.info(f"✓ Selected best design for next cycle: {os.path.basename(best_design)}")
+                    else:
+                        # Fallback to relaxed structure if no best design selected
+                        current_pdb = relaxed_pdb
+                        logger.info(f"✓ Using relaxed structure for next cycle: {os.path.basename(relaxed_pdb)}")
+                else:
+                    # If no MPNN designs were accepted, continue with relaxed structure
+                    current_pdb = relaxed_pdb
+                    logger.info(f"✓ No MPNN designs accepted, using relaxed structure: {os.path.basename(relaxed_pdb)}")
+            else:
+                current_pdb = relaxed_pdb
+                cycle_results.append({
+                    'cycle': cycle + 1,
+                    'relaxed_pdb': relaxed_pdb,
+                    'accepted_designs': 0,
+                    'traj_data': ws.traj_data.copy() if hasattr(ws.traj_data, 'copy') else ws.traj_data
+                })
+                logger.info(f"✓ MPNN disabled, using relaxed structure: {os.path.basename(relaxed_pdb)}")
+
+        logger.info(f"=== Optimization Complete ===")
+        logger.info(f"Total accepted MPNN designs across all cycles: {accepted_mpnn}")
+        
+        # Log summary of all cycles
+        logger.info("Cycle Summary:")
+        for result in cycle_results:
+            logger.info(f"  Cycle {result['cycle']}: {result['accepted_designs']} designs accepted")
+        
         return accepted_mpnn
 
 def main():
@@ -249,19 +354,31 @@ def main():
     pdb_files = pdb_handler.get_pdb_files(args.input)
     logger.info(f"Parsed PDB files: {len(pdb_files)}")
     accepted = 0
-
+    
+    # Initial MPNN sampling
+    # Evaluate Backbone designability: MPNN score
     mpnn_handler = MPNNHandler()
-    # customize loop
-    for pdb_path in pdb_files:
-        #accepted += pipeline.run_PDB_redesign(pdb_path, ws, designer, pdb_handler)
-        basename = os.path.basename(pdb_path).replace('.pdb', '')
-        score = mpnn_handler.get_mpnn_score(pdb_path, ws, pdb_handler)
-        print(f"for PDB {basename}, MPNN score: {score}")
+    for i, pdb_fpath in enumerate(pdb_files):
+        basename = os.path.basename(pdb_fpath).replace('.pdb', '')
+        score = mpnn_handler.get_mpnn_score(pdb_fpath, ws, pdb_handler) # sample 20 sequences and get the mean score
+        logger.info(f"MPNN score for {basename}: {score}")
+    
+    # Select top 200 BB designs based on MPNN score
+    # pick the top-ranked design from each BB group as representative design for MPNN redesign
+    mpnn_struct_seeds = mpnn_handler.select_topBB_design(ws, top_N=3)
+    logger.info(mpnn_struct_seeds.head())
 
-    #artifact.rerank_designs()
-    #print(f"Pipeline complete. Total accepted MPNN designs: {accepted}")
+    # MPNN redesign cycles
+    for file in mpnn_struct_seeds["Design"].unique():
+        # single MPNN design or multiple FR-MPNN design cycles
+        pdb_fpath = os.path.join(ws.design_paths["Trajectory"], f"{file}.pdb")
+        accepted += pipeline.run_PMPNN_redesign(pdb_fpath, ws, designer, pdb_handler, opt_cycles = 4, 
+                                                num_mpnn_sample=3, binder_chain='B')
+
+    artifact.rerank_designs()
     pipeline.end_time = time.time()
-    logger.info(f"Pipeline complete. Total time: {pipeline.end_time - pipeline.pipeline_start_time:.2f} seconds")
+    logger.info(f"Pipeline complete. Total accepted MPNN designs: {accepted}")
+    logger.info(f"Total time: {pipeline.end_time - pipeline.pipeline_start_time:.2f} seconds")
 
 if __name__ == "__main__":
     main() 

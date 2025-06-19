@@ -317,10 +317,6 @@ class Scorer:
                 "filters_file": self.filters_path,
                 "advanced_file": self.advanced_path
             }
-    
-    def score_mpnn(self, mpnn_data, design_labels, filters):
-        # check mpnn_data against labels
-        mpnn_dict = {label: value for label, value in zip(design_labels, mpnn_data)}
         
 class BinderDesign:
     def __init__(self, design_models: Any, settings: Dict[str, Any], design_paths: Dict[str, str], csv_paths: Dict[str,str]):
@@ -340,7 +336,7 @@ class BinderDesign:
         self.mpnn_dict = {}
         self.design_start_time = None
 
-        self.statistics_labels = statistics_labels = ['pLDDT', 'pTM', 'i_pTM', 'pAE', 'i_pAE', 'i_pLDDT', 'ss_pLDDT', 'Unrelaxed_Clashes', 'Relaxed_Clashes', 'Binder_Energy_Score', 'Surface_Hydrophobicity',
+        self.statistics_labels = ['pLDDT', 'pTM', 'i_pTM', 'pAE', 'i_pAE', 'i_pLDDT', 'ss_pLDDT', 'Unrelaxed_Clashes', 'Relaxed_Clashes', 'Binder_Energy_Score', 'Surface_Hydrophobicity',
                                             'ShapeComplementarity', 'PackStat', 'dG', 'dSASA', 'dG/dSASA', 'Interface_SASA_%', 'Interface_Hydrophobicity', 'n_InterfaceResidues', 'n_InterfaceHbonds', 'InterfaceHbondsPercentage',
                                             'n_InterfaceUnsatHbonds', 'InterfaceUnsatHbondsPercentage', 'Interface_Helix%', 'Interface_BetaSheet%', 'Interface_Loop%', 'Binder_Helix%',
                                             'Binder_BetaSheet%', 'Binder_Loop%', 'InterfaceAAs', 'Hotspot_RMSD', 'Target_RMSD']
@@ -378,6 +374,7 @@ class BinderDesign:
         self.mpnn_n = 1
         self.accepted_mpnn = 0
         self.design_start_time = time.time()
+        self.mpnn_dict = {}
         length = ws.traj_info["length"]
 
         ### MPNN redesign of starting binder
@@ -387,7 +384,7 @@ class BinderDesign:
         # create set of MPNN sequences with allowed amino acid composition
         restricted_AAs = set(aa.strip().upper() for aa in ws.advanced_settings["omit_AAs"].split(',')) if ws.advanced_settings["force_reject_AA"] else set()
 
-        mpnn_sequences = sorted({
+        mpnn_sequences = sorted({ 
             mpnn_traj['seq'][n][-length:]: {
                 'seq': mpnn_traj['seq'][n][-length:],
                 'score': mpnn_traj['score'][n],
@@ -413,7 +410,8 @@ class BinderDesign:
                 mpnn_score = round(mpnn_sequence['score'],2)
                 mpnn_seqid = round(mpnn_sequence['seqid'],2)
 
-                self.mpnn_dict[mpnn_design_name] = {'seq': mpnn_sequence['seq'], 'score': mpnn_score, 'seqid': mpnn_seqid}
+                self.mpnn_dict[mpnn_design_name] = {'seq': mpnn_sequence['seq'], 'score': mpnn_score, 'seqid': mpnn_seqid, 
+                                                'relaxed_pdb':[], "plddt_score": []}
                 
                 # save fasta sequence
                 if ws.advanced_settings["save_mpnn_fasta"] is True:
@@ -434,6 +432,7 @@ class BinderDesign:
                 for model_num in ws.traj_info["prediction_models"]:
                     mpnn_design_pdb = os.path.join(ws.design_paths["MPNN"], f"{mpnn_design_name}_model{model_num+1}.pdb")
                     mpnn_design_relaxed = os.path.join(ws.design_paths["MPNN/Relaxed"], f"{mpnn_design_name}_model{model_num+1}.pdb")
+                    self.mpnn_dict[mpnn_design_name]['relaxed_pdb'].append(mpnn_design_relaxed)
 
                     # score the design
                     mpnn_design_scores = scorer.score_traj(mpnn_sequence['seq'], mpnn_design_pdb, mpnn_design_relaxed, 
@@ -501,6 +500,7 @@ class BinderDesign:
 
                 # find best model number by pLDDT
                 plddt_values = {i: mpnn_data[i] for i in range(11, 15) if mpnn_data[i] is not None}
+                self.mpnn_dict[mpnn_design_name]['plddt_score'] = plddt_values
                 highest_plddt_key = int(max(plddt_values, key=plddt_values.get))
                 best_model_number = highest_plddt_key - 10
                 best_model_pdb = os.path.join(ws.design_paths["MPNN/Relaxed"], f"{mpnn_design_name}_model{best_model_number}.pdb")
@@ -571,7 +571,7 @@ class BinderDesign:
         design_time_text = f"{'%d hours, %d minutes, %d seconds' % (int(design_time // 3600), int((design_time % 3600) // 60), int(design_time % 60))}"
         design_logger.info(f"Design and validation of trajectory {ws.traj_info['name']} took: {design_time_text}")
 
-        return self.accepted_mpnn
+        return self.accepted_mpnn, self.mpnn_dict
 
     def prediction_models_prep(self, ws: Workspace, traj_pdb: str) -> Tuple[Any, Any]:
         # add optimisation for increasing recycles if trajectory is beta sheeted
@@ -761,7 +761,7 @@ class BindCraftPipeline:
                 design_logger.debug(f"Scored trajectory {name}, proceeding to MPNN if enabled.")
 
                 if ws.advanced_settings["enable_mpnn"]:
-                    accepted_mpnn = designer.mpnn_design(ws, traj_scorer, traj_pdb)
+                    accepted_mpnn, _ = designer.mpnn_design(ws, traj_scorer, traj_pdb)
                     self.accepted += accepted_mpnn
                     design_logger.debug(f"MPNN design for {name} complete. accepted_mpnn={accepted_mpnn}, total accepted={self.accepted}")
 
