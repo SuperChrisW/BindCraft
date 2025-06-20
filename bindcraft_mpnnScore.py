@@ -24,7 +24,7 @@ logging.basicConfig(
 )
 
 from bindcraft_module import (
-    Initialization, Workspace, Scorer, BinderDesign, ArtifactHandler, pr_relax, insert_data
+    Initialization, Workspace, Scorer, BinderDesign, ArtifactHandler, TerminationCriteria, pr_relax, insert_data
 )
 
 class PDBHandler:
@@ -122,18 +122,40 @@ class MPNNHandler:
         logger.info(f"MPNN scoring time: {time.time() - score_start_time:.2f} seconds")
         return np.mean([mpnn_sequences['score'][i] for i in range(ws.advanced_settings["num_seqs"])])
 
-    def select_topBB_design(self, ws, top_N: int = 200) -> pd.DataFrame:
+    def select_topBB_design(self, ws, top_N: int = 200, pick_strategy: str = 'top', num_pick_per_batch: int = 1) -> pd.DataFrame:
+        '''
+        Select the top-ranked designs from the MPNN scoring results.
+        Args:
+            ws: Workspace object
+            top_N: Number of top-ranked designs to select
+            pick_strategy: Strategy to pick the representative design from each group
+            num_pick_per_batch: Number of designs to pick from each group
+        Returns:
+            pd.DataFrame: DataFrame containing (top_N * num_pick_per_batch) designs
+        '''
         BB_df = pd.read_csv(ws.csv_paths["mpnn_bb_score_stats"])
-        BB_grouped = BB_df.groupby("Design")["MPNN_score"].mean().reset_index()
-        BB_grouped_sorted = BB_grouped.sort_values(by="MPNN_score", ascending=True)
-        top_designs = BB_grouped_sorted.head(top_N)
-        
+        BB_df['Length'] = BB_df['Sequence'].apply(len)
+        #BB_grouped = BB_df.groupby("Design")["MPNN_score"].mean().reset_index()
+        #BB_grouped_sorted = BB_grouped.sort_values(by="MPNN_score", ascending=True)
+        BB_GS_L50 = BB_df[BB_df["Length"] <= 50].groupby("Design")["MPNN_score"].mean().reset_index()
+        BB_GS_M50 = BB_df[BB_df["Length"] > 50].groupby("Design")["MPNN_score"].mean().reset_index()
+        #top_designs = BB_grouped_sorted.head(top_N)
+        top_designs = pd.concat([BB_GS_L50.head(top_N//2), BB_GS_M50.head(top_N//2)])
+
         representative_designs = BB_df[BB_df["Design"].isin(top_designs["Design"])]
         # For each group, pick the top-ranked entry as the representative design
-        final_grouped_table = representative_designs.groupby("Design").apply(
-            lambda x: x.nsmallest(1, "MPNN_score")
-        ).reset_index(drop=True)
+        if pick_strategy == 'top':
+            final_grouped_table = representative_designs.groupby("Design").apply(
+                lambda x: x.nsmallest(num_pick_per_batch, "MPNN_score")
+            ).reset_index(drop=True)
+        elif pick_strategy == 'random':
+            final_grouped_table = representative_designs.groupby("Design").apply(
+                lambda x: x.sample(n=num_pick_per_batch, random_state=42)
+            ).reset_index(drop=True)
+        else:
+            raise ValueError(f"Invalid pick_strategy: {pick_strategy}")
         
+        final_grouped_table.to_csv(ws.csv_paths["mpnn_bb_score_stats"].replace(".csv", "_selected.csv"), index=False)
         return final_grouped_table
 
 class CustomPipeline:
@@ -191,10 +213,11 @@ class CustomPipeline:
         logger.info(f"BinderDesign initialized.")
 
         artifact = ArtifactHandler(ws.design_paths, ws.settings, ws.csv_paths)
+        criteria = TerminationCriteria(ws.settings['advanced_settings'])
         logger.info(f"ArtifactHandler initialized.")
         pr.init(f'-ignore_unrecognized_res -ignore_zero_occupancy -mute all -holes:dalphaball {ws.advanced_settings["dalphaball_path"]} -corrections::beta_nov16 true -relax:default_repeats 1')
 
-        return ws, designer, artifact
+        return ws, designer, artifact, criteria
     
     def update_traj_info(self, ws, name, binder_chain, length, seed=0, helicity_value=None, traj_time_text=""):
         ws.traj_info = {
@@ -233,7 +256,7 @@ class CustomPipeline:
         else:
             return None
 
-    def run_PMPNN_redesign(self, pdb_path, ws, designer, pdb_handler, opt_cycles=1, num_mpnn_sample = 20, binder_chain = 'B'):
+    def run_PMPNN_redesign(self, pdb_path, ws, designer, pdb_handler, criteria, opt_cycles=1, num_mpnn_sample = 20, binder_chain = 'B'):
         '''
         This function is used to redesign a PDB file using BindCraft pipeline with iterative optimization.
         
@@ -274,6 +297,13 @@ class CustomPipeline:
 
         logger.info(f"Starting iterative optimization with {opt_cycles} cycles")
         for cycle in range(opt_cycles):
+            # apply an early stopping criterion to prevent contact <3 aa | ca clashes model
+            if not criteria.quality_check(current_pdb, ws.csv_paths["failure_csv"]):
+                logger.info(f"✓ Early stopping: {current_pdb} failed quality check")
+                break
+            else:
+                logger.info(f"✓ {current_pdb} passed quality check")
+
             logger.info(f"=== Optimization Cycle {cycle + 1}/{opt_cycles} ===")
             scorer = self.update_traj_info(ws, f"{name}_cycle{cycle}", binder_chain, length, seed=0, helicity_value=None, traj_time_text=f"Cycle {cycle + 1}")
 
@@ -294,7 +324,7 @@ class CustomPipeline:
             cycle_accepted = 0
             if ws.advanced_settings["enable_mpnn"]:
                 logger.info(f"Step 3: MPNN sequence redesign")
-                ws.advanced_settings['num_seqs'] = num_mpnn_sample 
+                ws.advanced_settings['max_mpnn_sequences'] = num_mpnn_sample if ws.advanced_settings['num_seqs'] > num_mpnn_sample else ws.advanced_settings['num_seqs']
                 cycle_accepted, mpnn_dict = designer.mpnn_design(ws, scorer, relaxed_pdb)
                 #note: relaxed traj pdb will be removed in set in advanced_settings
                 accepted_mpnn += cycle_accepted
@@ -320,9 +350,9 @@ class CustomPipeline:
                         current_pdb = relaxed_pdb
                         logger.info(f"✓ Using relaxed structure for next cycle: {os.path.basename(relaxed_pdb)}")
                 else:
-                    # If no MPNN designs were accepted, continue with relaxed structure
-                    current_pdb = relaxed_pdb
-                    logger.info(f"✓ No MPNN designs accepted, using relaxed structure: {os.path.basename(relaxed_pdb)}")
+                    # If no MPNN designs were accepted, highly possible that this backbone is not suitable 
+                    logger.info(f"✓ No MPNN designs accepted, skipping this design")
+                    break
             else:
                 current_pdb = relaxed_pdb
                 cycle_results.append({
@@ -347,7 +377,7 @@ def main():
     # Initialize pipeline
     pipeline = CustomPipeline()
     args = pipeline.parse_args()
-    ws, designer, artifact = pipeline.init_pipeline(args)
+    ws, designer, artifact, criteria = pipeline.init_pipeline(args)
 
     # Get input PDBs
     pdb_handler = PDBHandler()
@@ -365,15 +395,17 @@ def main():
     
     # Select top 200 BB designs based on MPNN score
     # pick the top-ranked design from each BB group as representative design for MPNN redesign
-    mpnn_struct_seeds = mpnn_handler.select_topBB_design(ws, top_N=3)
-    logger.info(mpnn_struct_seeds.head())
+    mpnn_struct_seeds = mpnn_handler.select_topBB_design(ws, top_N=300) #50% for length <= 50, 50% for length > 50
+    logger.info(f"Selected {len(mpnn_struct_seeds)} designs for MPNN redesign")
 
     # MPNN redesign cycles
     for file in mpnn_struct_seeds["Design"].unique():
         # single MPNN design or multiple FR-MPNN design cycles
         pdb_fpath = os.path.join(ws.design_paths["Trajectory"], f"{file}.pdb")
-        accepted += pipeline.run_PMPNN_redesign(pdb_fpath, ws, designer, pdb_handler, opt_cycles = 4, 
-                                                num_mpnn_sample=3, binder_chain='B')
+        accepted += pipeline.run_PMPNN_redesign(pdb_fpath, ws, designer, pdb_handler, criteria, opt_cycles = 5, 
+                                                num_mpnn_sample=10, binder_chain='B')
+        # total designs = top_N Backbone * opt_cycles * num_mpnn_sample
+        # 300 * 5 * 10 = 15000 designs
 
     artifact.rerank_designs()
     pipeline.end_time = time.time()

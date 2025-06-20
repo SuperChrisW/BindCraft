@@ -233,6 +233,322 @@ class TerminationCriteria:
         success_rate = self.advanced.get("acceptance_rate", 0.5)
         return accepted / attempted < success_rate
 
+    def quality_check(self, model_pdb_path: str, failure_csv: str) -> bool:
+        '''
+        Check the quality of the trajectory
+        adapted from bindercraft.colabdesign_utils.binder_hallucination
+        '''
+        ca_clashes = calculate_clash_score(model_pdb_path, 2.5, only_ca=True)
+
+        #if clash_interface > 25 or ca_clashes > 0:
+        if ca_clashes > 0:
+            update_failures(failure_csv, 'Trajectory_Clashes')
+            logger.info("Severe clashes detected, skipping analysis and MPNN optimisation")
+            return False
+        else:
+            # does it have enough contacts to consider?
+            binder_contacts = hotspot_residues(model_pdb_path)
+            binder_contacts_n = len(binder_contacts.items())
+
+            # if less than 3 contacts then protein is floating above and is not binder
+            if binder_contacts_n < 3:
+                update_failures(failure_csv, 'Trajectory_Contacts')
+                logger.info("Too few contacts at the interface, skipping analysis and MPNN optimisation")
+                return False
+            else:
+                # phew, trajectory is okay! We can continue
+                return True
+
+class Filter:
+    def __init__(self, ws: Workspace):
+        self.target_settings = ws.settings['target_settings']
+        self.advanced_settings = ws.settings['advanced_settings']
+        self.filters_settings = ws.settings['filters_settings']
+        self.settings_path = ws.settings['settings_path']
+        self.filters_path = ws.settings['filters_path']
+        self.design_paths = ws.design_paths
+        self.csv_paths = ws.csv_paths
+        self.traj_info = ws.traj_info
+        self.traj_data = ws.traj_data
+    
+    def validate_sequence(self, sequence: str) -> bool:
+        """
+        Step 1: Validate sequence based on sequence-level metrics
+        """
+        # Basic sequence validation - check if sequence contains only valid amino acids
+        import re
+        valid_aa = set('ACDEFGHIKLMNPQRSTVWY')
+        sequence_upper = sequence.upper()
+        
+        # Check if sequence contains only valid amino acids
+        if not all(aa in valid_aa for aa in sequence_upper):
+            return False
+        
+        # Check sequence length constraints
+        min_length = self.advanced_settings.get("min_binder_length", 10)
+        max_length = self.advanced_settings.get("max_binder_length", 200)
+        
+        if len(sequence) < min_length or len(sequence) > max_length:
+            return False
+        
+        # Check for forbidden amino acids if specified
+        if self.advanced_settings.get("omit_AAs"):
+            omit_aas = set(self.advanced_settings["omit_AAs"].upper().split(','))
+            if any(aa in omit_aas for aa in sequence_upper):
+                return False
+        
+        return True
+    
+    def model_complex_structure(self, sequence: str, prediction_models) -> Tuple[str, Dict, bool]:
+        """
+        Step 2: Model the complex structure with early stopping based on AF2 filters and low contact area
+        """
+        # Generate a temporary design name for this sequence
+        temp_design_name = f"filter_check_{hash(sequence) % 10000}"
+        
+        # Clear GPU memory
+        clear_mem()
+        
+        # Check if we have a target PDB or if we're doing sequence-only prediction
+        has_target_pdb = hasattr(self.target_settings, "starting_pdb") and self.target_settings.get("starting_pdb")
+        
+        if has_target_pdb:
+            # Use binder protocol with target PDB
+            prediction_model = mk_afdesign_model(
+                protocol="binder", 
+                debug=False, 
+                data_dir=self.advanced_settings["af_params_dir"],
+                use_multimer=self.advanced_settings.get("use_multimer_design", False),
+                num_recycles=self.advanced_settings.get("num_recycles_validation", 3),
+                best_metric='loss'
+            )
+            
+            # Prepare inputs for binder prediction
+            prediction_model.prep_inputs(
+                pdb_filename=self.target_settings["starting_pdb"],
+                chain=self.target_settings["chains"],
+                binder_len=len(sequence)
+            )
+            
+            # Set the sequence
+            prediction_model.set_seq(sequence)
+            
+            # Predict complex structure
+            complex_pdb_path = os.path.join(self.design_paths["MPNN"], f"{temp_design_name}_model1.pdb")
+            
+            # Use predict_binder_complex function
+            prediction_stats, pass_af2_filters = predict_binder_complex(
+                prediction_model=prediction_model,
+                binder_sequence=sequence,
+                mpnn_design_name=temp_design_name,
+                target_pdb=self.target_settings["starting_pdb"],
+                chain=self.target_settings["chains"],
+                length=len(sequence),
+                trajectory_pdb="",  # Not needed for this use case
+                prediction_models=[0],  # Use first model
+                advanced_settings=self.advanced_settings,
+                filters=self.filters_settings,
+                design_paths=self.design_paths,
+                failure_csv=self.csv_paths["failure_csv"]
+            )
+            
+        else:
+            # Use hallucination protocol for sequence-only prediction
+            prediction_model = mk_afdesign_model(
+                protocol="hallucination", 
+                debug=False, 
+                data_dir=self.advanced_settings["af_params_dir"],
+                use_multimer=False,  # Single chain prediction
+                num_recycles=self.advanced_settings.get("num_recycles_validation", 3),
+                best_metric='loss'
+            )
+            
+            # Prepare inputs for hallucination
+            prediction_model.prep_inputs(
+                length=len(sequence)
+            )
+            
+            # Set the sequence
+            prediction_model.set_seq(sequence)
+            
+            # Predict structure
+            complex_pdb_path = os.path.join(self.design_paths["MPNN"], f"{temp_design_name}_model1.pdb")
+            
+            # Use predict_binder_alone function for single chain prediction
+            prediction_stats = predict_binder_alone(
+                prediction_model=prediction_model,
+                binder_sequence=sequence,
+                mpnn_design_name=temp_design_name,
+                length=len(sequence),
+                trajectory_pdb="",  # Not needed for this use case
+                binder_chain="A",  # Single chain
+                prediction_models=[0],  # Use first model
+                advanced_settings=self.advanced_settings,
+                design_paths=self.design_paths
+            )
+            
+            # For hallucination, we need to check basic quality metrics
+            pass_af2_filters = True
+            if 1 in prediction_stats:
+                plddt = prediction_stats[1].get('pLDDT', 0)
+                ptm = prediction_stats[1].get('pTM', 0)
+                pae = prediction_stats[1].get('pAE', 0)
+                
+                # Basic quality checks for hallucination
+                if plddt < 0.7 or ptm < 0.5 or pae > 10.0:
+                    pass_af2_filters = False
+        
+        # Check if AF2 filters passed
+        if not pass_af2_filters:
+            return "", {}, False
+        
+        # For sequence-only prediction, skip contact area check since there's no interface
+        if not has_target_pdb:
+            # Get prediction metrics
+            traj_metrics = {}
+            if 1 in prediction_stats:
+                traj_metrics = {
+                    'plddt': prediction_stats[1].get('pLDDT', 0),
+                    'ptm': prediction_stats[1].get('pTM', 0),
+                    'i_ptm': 0.0,  # No interface for single chain
+                    'pae': prediction_stats[1].get('pAE', 0),
+                    'i_pae': 0.0   # No interface for single chain
+                }
+            
+            return complex_pdb_path, traj_metrics, True
+        
+        # Check for low contact area using hotspot_residues (only for binder protocol)
+        from .functions.biopython_utils import hotspot_residues
+        binder_contacts = hotspot_residues(complex_pdb_path)
+        binder_contacts_n = len(binder_contacts.items())
+        
+        # If less than 3 contacts, protein is floating and not a good binder
+        if binder_contacts_n < 3:
+            return "", {}, False
+        
+        # Get prediction metrics
+        traj_metrics = {}
+        if 1 in prediction_stats:
+            traj_metrics = {
+                'plddt': prediction_stats[1].get('pLDDT', 0),
+                'ptm': prediction_stats[1].get('pTM', 0),
+                'i_ptm': prediction_stats[1].get('i_pTM', 0),
+                'pae': prediction_stats[1].get('pAE', 0),
+                'i_pae': prediction_stats[1].get('i_pAE', 0)
+            }
+        
+        return complex_pdb_path, traj_metrics, True
+    
+    def score_trajectory(self, sequence: str, predicted_pdb: str, traj_metrics: Dict) -> Dict:
+        """
+        Step 3: Score the trajectory using the Scorer class
+        """
+        # Create a temporary relaxed PDB path
+        temp_relaxed_pdb = predicted_pdb.replace('.pdb', '_relaxed.pdb')
+        
+        # Relax the structure using pr_relax
+        from .functions.pyrosetta_utils import pr_relax
+        pr_relax(predicted_pdb, temp_relaxed_pdb)
+        
+        # Create a mock traj_info for the Scorer
+        mock_traj_info = {
+            "name": f"filter_check_{hash(sequence) % 10000}",
+            "length": len(sequence),
+            "seed": 0,
+            "helicity_value": 0,
+            "binder_chain": "B",
+            "traj_time_text": "0:00:00"
+        }
+        
+        # Create a mock workspace for the Scorer
+        mock_ws = type('MockWorkspace', (), {
+            'settings': {
+                'target_settings': self.target_settings,
+                'advanced_settings': self.advanced_settings,
+                'filters_settings': self.filters_settings
+            },
+            'design_paths': self.design_paths,
+            'traj_info': mock_traj_info
+        })()
+        
+        # Use the Scorer class to score the trajectory
+        scorer = Scorer(mock_ws)
+        scoring_result = scorer.score_traj(
+            traj_seq=sequence,
+            traj_pdb=predicted_pdb,
+            traj_relaxed=temp_relaxed_pdb,
+            traj_metrics=traj_metrics,
+            binder_chain="B"
+        )
+        
+        # Clean up temporary files
+        if os.path.exists(temp_relaxed_pdb):
+            os.remove(temp_relaxed_pdb)
+        
+        return scoring_result
+    
+    def check_filters(self, scoring_result: Dict) -> bool:
+        """
+        Step 4: Check the full filters using check_filters from generic_utils
+        """
+        # Get design labels from advanced settings or use default
+        design_labels = self.advanced_settings.get("design_labels", [])
+        if not design_labels:
+            # Use default labels if not specified
+            _, design_labels, _ = generate_dataframe_labels()
+        
+        # Extract data for filter checking
+        mpnn_data = [scoring_result.get(label, None) for label in design_labels]
+        
+        # Use check_filters from generic_utils
+        filter_result = check_filters(mpnn_data, design_labels, self.filters_settings)
+        
+        return filter_result is True
+    
+    def pass_filters(self, sequence: str) -> Tuple[bool, Dict]:
+        """
+        Complete filter workflow:
+        1. Validate sequence based on sequence-level metrics
+        2. Model the complex structure with early stopping
+        3. Score trajectory
+        4. Check the full filters
+        5. Collect data and return
+        """
+        # Step 1: Validate sequence
+        if not self.validate_sequence(sequence):
+            return False, {"error": "Sequence validation failed"}
+        
+        # Step 2: Model complex structure
+        prediction_models = [0]  # Use first model for efficiency
+        predicted_pdb, traj_metrics, modeling_success = self.model_complex_structure(sequence, prediction_models)
+        
+        if not modeling_success:
+            return False, {"error": "Structure modeling failed or early stopping triggered"}
+        
+        # Step 3: Score trajectory
+        try:
+            scoring_result = self.score_trajectory(sequence, predicted_pdb, traj_metrics)
+        except Exception as e:
+            return False, {"error": f"Scoring failed: {str(e)}"}
+        
+        # Step 4: Check filters
+        filter_passed = self.check_filters(scoring_result)
+        
+        # Step 5: Collect data and return
+        result_data = {
+            "sequence": sequence,
+            "predicted_pdb": predicted_pdb,
+            "traj_metrics": traj_metrics,
+            "scoring_result": scoring_result,
+            "filter_passed": filter_passed
+        }
+        
+        # Clean up temporary files
+        if os.path.exists(predicted_pdb):
+            os.remove(predicted_pdb)
+        
+        return filter_passed, result_data
+
 class Scorer:
     def __init__(self, ws: Workspace):
         self.target_settings = ws.settings['target_settings']
