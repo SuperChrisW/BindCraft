@@ -6,6 +6,7 @@ import glob
 import pandas as pd
 from typing import List, Dict, Any
 from functions.pyrosetta_utils import *
+from Bio.PDB import PDBParser, PPBuilder
 
 import logging
 
@@ -19,49 +20,52 @@ from bindcraft_module import (
     Initialization, Workspace, Scorer, BinderDesign, ArtifactHandler, pr_relax, insert_data
 )
 
-def get_pdb_files(input_path: str) -> List[str]:
-    """
-    Accepts a directory or a comma-separated list of files and returns a list of PDB file paths.
-    """
-    if os.path.isdir(input_path):
-        pdbs = sorted(glob.glob(os.path.join(input_path, '*.pdb')))
-        if not pdbs:
-            raise FileNotFoundError(f"No .pdb files found in directory: {input_path}")
-        return pdbs
-    else:
-        # Assume comma-separated list
-        pdbs = [p.strip() for p in input_path.split(',') if p.strip()]
-        for p in pdbs:
-            if not os.path.isfile(p):
-                raise FileNotFoundError(f"PDB file not found: {p}")
-        return pdbs
+class PDBHandler:
+    def __init__(self):
+        pass
 
-def infer_length_from_pdb(pdb_path: str, chain: str = 'B') -> int:
-    """
-    Infer the length of the binder chain from the PDB file.
-    """
-    length = 0
-    with open(pdb_path) as f:
-        for line in f:
-            if line.startswith('ATOM') and line[21].strip() == chain:
-                resseq = line[22:26].strip()
-                length = max(length, int(resseq))
-    return length
+    def get_pdb_files(self, input_path: str) -> List[str]:
+        """
+        Accepts a directory or a comma-separated list of files and returns a list of PDB file paths.
+        """
+        if os.path.isdir(input_path):
+            pdbs = sorted(glob.glob(os.path.join(input_path, '*.pdb')))
+            if not pdbs:
+                raise FileNotFoundError(f"No .pdb files found in directory: {input_path}")
+            return pdbs
+        else:
+            # Assume comma-separated list
+            pdbs = [p.strip() for p in input_path.split(',') if p.strip()]
+            for p in pdbs:
+                if not os.path.isfile(p):
+                    raise FileNotFoundError(f"PDB file not found: {p}")
+            return pdbs
 
-def get_sequence_from_pdb(pdb_path: str, chain: str = 'B') -> str:
-    """
-    Extract the sequence of the specified chain from a PDB file.
-    """
-    from Bio.PDB import PDBParser, PPBuilder
-    parser = PDBParser(QUIET=True)
-    structure = parser.get_structure('binder', pdb_path)
-    for model in structure:
-        for ch in model:
-            if ch.id == chain:
-                ppb = PPBuilder()
-                seqs = [str(pp.get_sequence()) for pp in ppb.build_peptides(ch)]
-                return ''.join(seqs)
-    return ''
+    def infer_length_from_pdb(self, pdb_path: str, chain: str = 'B') -> int:
+        """
+        Infer the length of the binder chain from the PDB file.
+        """
+        length = 0
+        with open(pdb_path) as f:
+            for line in f:
+                if line.startswith('ATOM') and line[21].strip() == chain:
+                    resseq = line[22:26].strip()
+                    length = max(length, int(resseq))
+        return length
+
+    def get_sequence_from_pdb(self, pdb_path: str, chain: str = 'B') -> str:
+        """
+        Extract the sequence of the specified chain from a PDB file.
+        """
+        parser = PDBParser(QUIET=True)
+        structure = parser.get_structure('binder', pdb_path)
+        for model in structure:
+            for ch in model:
+                if ch.id == chain:
+                    ppb = PPBuilder()
+                    seqs = [str(pp.get_sequence()) for pp in ppb.build_peptides(ch)]
+                    return ''.join(seqs)
+        return ''
 
 def main():
     parser = argparse.ArgumentParser(description='BindCraft pipeline from pre-generated PDBs (skip hallucination).')
@@ -95,7 +99,8 @@ def main():
     cfg = initializer.run()
 
     # Get input PDBs
-    pdb_files = get_pdb_files(args.input)
+    pdb_handler = PDBHandler()
+    pdb_files = pdb_handler.get_pdb_files(args.input)
     logger.info(f"Parsed PDB files: {len(pdb_files)}")
     
     ws = Workspace(cfg)
@@ -120,8 +125,8 @@ def main():
 
         # Infer length and sequence
         binder_chain = 'B'
-        length = infer_length_from_pdb(dest_pdb, binder_chain)
-        seq = get_sequence_from_pdb(dest_pdb, binder_chain)
+        length = pdb_handler.infer_length_from_pdb(dest_pdb, binder_chain)
+        seq = pdb_handler.get_sequence_from_pdb(dest_pdb, binder_chain)
 
         ws.traj_info = {
             "name": name,
