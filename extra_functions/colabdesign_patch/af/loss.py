@@ -183,6 +183,87 @@ class _af_loss:
 
     aux["losses"].update(losses)
 
+  # partial binder modifications
+  def _loss_partial_binder(self, inputs, outputs, aux):
+    '''get losses for partial_binder protocol - combines partial and binder logic'''
+    opt = inputs["opt"]
+    
+    # Binder-specific interface losses (using full inputs/outputs)
+    mask = inputs["seq_mask"]
+    zeros = jnp.zeros_like(mask)
+    tL,bL = self._target_len, self._new_binder_len
+    binder_id = zeros.at[-bL:].set(mask[-bL:])
+    
+    if "hotspot" in opt:
+      target_id = zeros.at[opt["hotspot"]].set(mask[opt["hotspot"]])
+      i_con_loss = get_con_loss(inputs, outputs, opt["i_con"], mask_1d=target_id, mask_1b=binder_id)
+    else:
+      target_id = zeros.at[:tL].set(mask[:tL])
+      i_con_loss = get_con_loss(inputs, outputs, opt["i_con"], mask_1d=binder_id, mask_1b=target_id)
+
+    # Interface losses
+    aux["losses"].update({
+      "plddt": get_plddt_loss(outputs, mask_1d=binder_id), # plddt over binder
+      "exp_res": get_exp_res_loss(outputs, mask_1d=binder_id),
+      "pae": get_pae_loss(outputs, mask_1d=binder_id), # pae over binder + interface
+      "con": get_con_loss(inputs, outputs, opt["con"], mask_1d=binder_id, mask_1b=binder_id),
+      # interface
+      "i_con":   i_con_loss,
+      "i_pae":   get_pae_loss(outputs, mask_1d=binder_id, mask_1b=target_id),
+    })
+
+    # Supervised losses
+    pos = opt["pos"] if opt["pos"] is not None else self._opt["pos"]
+    pos = jnp.array([p+self._target_len for p in pos])
+    def sub(x, axis=0):
+      return jax.tree_map(lambda y:jnp.take(y,pos,axis),x)
+    
+    copies = self._args["copies"] if self._args["homooligomer"] else 1
+    dgram = {"logits":sub(sub(outputs["distogram"]["logits"]),1),
+             "bin_edges":outputs["distogram"]["bin_edges"]}
+    atoms = sub(outputs["structure_module"]["final_atom_positions"])
+    
+    I = {"aatype": sub(inputs["aatype"]), "batch": sub(inputs["batch"]), "seq_mask":sub(inputs["seq_mask"])}
+    O = {"distogram": dgram, "structure_module": {"final_atom_positions": atoms}}
+    aln = get_rmsd_loss(I, O, copies=copies)
+
+    cce = get_dgram_loss(inputs, outputs, aatype=inputs["aatype"], return_mtx=True)
+    fape = get_fape_loss(inputs, outputs, clamp=opt["fape_cutoff"], return_mtx=True)
+
+    # supervised losses
+    aux["losses"].update({
+      "dgram_cce": cce[pos].sum() / (mask[pos].sum() + 1e-8),
+      "fape":      fape[pos].sum() / (mask[pos].sum() + 1e-8),
+      "rmsd":      aln["rmsd"],
+    })
+
+    # sidechain specific losses
+    if self._args["use_sidechains"] and copies == 1:
+      struct = outputs["structure_module"]
+      pred_pos = sub(struct["final_atom14_positions"])
+      true_pos = all_atom.atom37_to_atom14(sub(inputs["batch"]["all_atom_positions"]), self._sc["batch"])
+
+      # sc_rmsd
+      aln = _get_sc_rmsd_loss(true_pos, pred_pos, self._sc["pos"])
+      aux["losses"]["sc_rmsd"] = aln["rmsd"]
+      
+      # sc_fape
+      if not self._args["use_multimer"]:
+        sc_struct = {**folding.compute_renamed_ground_truth(self._sc["batch"], pred_pos),
+                      "sidechains":{k: sub(struct["sidechains"][k],1) for k in ["frames","atom_pos"]}}
+        batch =     {**sub(inputs["batch"]),
+                      **all_atom.atom37_to_frames(**sub(inputs["batch"]))}
+        aux["losses"]["sc_fape"] = folding.sidechain_loss(batch, sc_struct,
+          self._cfg.model.heads.structure_module)["loss"]
+    else:  
+      # TODO
+      print("ERROR: 'sc_fape' not currently supported for 'multimer' mode")
+      aux["losses"]["sc_fape"] = 0.0
+    
+    # Align final atoms
+    if self._args["realign"]:
+      aux["atom_positions"] = aln["align"](aux["atom_positions"]) * aux["atom_mask"][...,None]
+
 #####################################################################################
 
 def get_plddt(outputs):
@@ -547,7 +628,6 @@ def get_mlm_loss(outputs, mask, truth=None):
   ent = (ent * mask).sum(-1) / (mask.sum() + 1e-8)
   return {"mlm":ent.mean()}
 
-# modify
 # compute pTMEnergy score
 def get_pTMEnergy(inputs, outputs, interface=False):
     pae = {"residue_weights":inputs["seq_mask"],

@@ -50,24 +50,38 @@ def add_cyclic_offset(self, offset_type=2):
     return offset
 
 # hallucinate a binder
-def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residues, length, seed, helicity_value, design_models, advanced_settings, design_paths, failure_csv):
+def binder_hallucination(design_name, target_settings, length, seed, helicity_value, design_models, 
+                        advanced_settings, design_paths, failure_csv, protocol="binder", debug=False):
+    starting_pdb = target_settings["starting_pdb"]
+    chain = target_settings.get("target_chain") if 'target_chain' in target_settings else target_settings.get("chains", "A")
+    target_hotspot_residues = target_settings["target_hotspot_residues"]
+
     model_pdb_path = os.path.join(design_paths["Trajectory"], design_name+".pdb")
 
     # clear GPU memory for new trajectory
     clear_mem()
 
     # initialise binder hallucination model
-    af_model = mk_afdesign_model(protocol="binder", debug=False, data_dir=advanced_settings["af_params_dir"], 
-                                use_multimer=advanced_settings["use_multimer_design"], num_recycles=advanced_settings["num_recycles_design"],
-                                best_metric='loss')
+    if protocol == "binder":
+        af_model = mk_afdesign_model(protocol="binder", debug=False, data_dir=advanced_settings["af_params_dir"], 
+                                    use_multimer=advanced_settings["use_multimer_design"], num_recycles=advanced_settings["num_recycles_design"],
+                                    best_metric='loss')
 
-    # sanity check for hotspots
-    if target_hotspot_residues == "":
-        target_hotspot_residues = None
+        # sanity check for hotspots
+        if target_hotspot_residues == "":
+            target_hotspot_residues = None
 
-    af_model.prep_inputs(pdb_filename=starting_pdb, chain=chain, binder_len=length, hotspot=target_hotspot_residues, seed=seed, rm_aa=advanced_settings["omit_AAs"],
-                        rm_target_seq=advanced_settings["rm_template_seq_design"], rm_target_sc=advanced_settings["rm_template_sc_design"])
+        af_model.prep_inputs(pdb_filename=starting_pdb, chain=chain, binder_len=length, hotspot=target_hotspot_residues, seed=seed, rm_aa=advanced_settings["omit_AAs"],
+                            rm_target_seq=advanced_settings["rm_template_seq_design"], rm_target_sc=advanced_settings["rm_template_sc_design"])
+    elif protocol == "partial_binder":
+        # initialise partial binder hallucination model
+        af_model = partial_binder_prep(design_name, target_settings, length, advanced_settings)
+        af_model.opt["weights"].update({"fape":advanced_settings["fape_weight"],
+                                    "dgram_cce":advanced_settings["dgram_cce_weight"],
+                                    "rmsd":advanced_settings["rmsd_weight"],
+                                    })
     
+    af_model.debug = debug
     # adapted from AfCycDesign, Wang Liyao, 2025-06-06
     if advanced_settings["enable_cyclic"]:
         add_cyclic_offset(af_model, offset_type=2)
@@ -84,7 +98,6 @@ def binder_hallucination(design_name, starting_pdb, chain, target_hotspot_residu
     af_model.opt["con"].update({"num":advanced_settings["intra_contact_number"],"cutoff":advanced_settings["intra_contact_distance"],"binary":False,"seqsep":9})
     af_model.opt["i_con"].update({"num":advanced_settings["inter_contact_number"],"cutoff":advanced_settings["inter_contact_distance"],"binary":False})
         
-
     ### additional loss functions
     if advanced_settings["use_rg_loss"]:
         # radius of gyration loss
@@ -525,3 +538,76 @@ def add_pTMEnergy_loss(self, weight=0.1):
     
     self._callbacks["model"]["loss"].append(loss_pTMEnergy)
     self.opt["weights"]["ptmEnergy"] = weight
+
+# modify 250714 add partial_binder protocol to preserve binder motif
+def partial_binder_prep(design_name, target_settings, length, advanced_settings):
+    pdb_filename = target_settings['starting_pdb']  # You'll need to provide a real PDB file
+    target_chain = target_settings['target_chain']
+    binder_chain = target_settings['binder_chain']
+    fix_motif = target_settings['fix_motif']  # Define positions to fix in binder chain
+    hotspots = target_settings['target_hotspot_residues']
+    loops = target_settings['loops']  # List of loop lengths between segments, C_term, e.g. [5, 10, 15], support range definition
+    order = target_settings['order']
+    N_term = 0
+    length_redesign = True
+
+    assert len(loops.split(",")) == len(fix_motif.split(",")) , f"Must define N_term segment and all gaps between segments in loops: {loops} for motif {fix_motif}"
+    if not order:
+        order = np.arange(len(fix_motif.split(",")))
+    # determine loop lengths
+    fn = lambda x: np.random.randint(int(x[0]), int(x[1]) + 1) 
+    fn2 = lambda x: int(x[1][1:]) - int(x[0][1:]) + 1 # first element is chain ID, e.g. A10-A25
+    count = 0
+    while length_redesign:
+        loop_len = [fn(l.split('-')) for l in loops.split(",")]
+        motif_len = [fn2(l.split('-')) for l in fix_motif.split(",")]
+        if length < sum(motif_len):
+            raise ValueError(f"Length {length} is too short for motif {fix_motif} and loops {loops}")
+        elif length >= sum(motif_len) + sum(loop_len):
+            length_redesign = False
+        else:
+            count += 1
+            if count > 100:
+                raise ValueError(f"Length {length} is not compatible with motif {fix_motif} and loops {loops}")
+
+    N_term = int(loop_len[0])  # Convert to integer if it's a string like 'A10'
+    loop_len = loop_len[1:] # Remove N_term segment length
+    partial_binder_flags = {
+      "binder_chain":binder_chain,
+      "binder_len":length,
+      "use_multimer":advanced_settings['use_multimer_design'],
+      "ignore_missing":False,
+      "pos":fix_motif,
+      "fix_pos":True,
+      "hotspots":hotspots,
+
+      "rm_target":False,
+      "rm_target_seq":advanced_settings['rm_template_seq_design'],
+      "rm_target_sc":advanced_settings['rm_template_sc_design'],
+
+      "rm_binder":True,
+      "rm_binder_seq":True,
+      "rm_binder_sc":True,
+      
+      "rm_template_ic":False,
+      "use_sidechains":advanced_settings['use_sidechains'],
+    }
+
+    model = mk_afdesign_model(protocol='partial_binder', debug=False, data_dir=advanced_settings["af_params_dir"], 
+                        use_multimer=advanced_settings["use_multimer_design"], num_recycles=advanced_settings["num_recycles_design"],
+                        best_metric='loss')
+
+    model.prep_inputs(
+        pdb_filename=pdb_filename,
+        target_chain=target_chain,
+        **partial_binder_flags,
+    )
+
+    model.restart(seq=None)
+    model.rewire(order = order, # set order of segments
+                loops =  loop_len,  # change loop length inbetween segments
+                offset=N_term)     # essentially loop length at the N term
+    
+    return model
+
+    
