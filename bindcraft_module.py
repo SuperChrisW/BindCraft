@@ -172,6 +172,8 @@ class Workspace:
     Sets up output directories, CSV/statistics file paths, and settings for downstream modules.
     """
     def __init__(self, cfg: Dict[str, Any]):
+        if "chains" not in cfg["target_settings"]:
+            cfg["target_settings"]["chains"] = cfg["target_settings"].get("target_chain")
         self.target_settings = cfg["target_settings"]
         self.filters_settings = cfg["filters_settings"]
         self.advanced_settings = cfg["advanced_settings"]
@@ -374,7 +376,7 @@ class BinderDesign:
                                             'n_InterfaceUnsatHbonds', 'InterfaceUnsatHbondsPercentage', 'Interface_Helix%', 'Interface_BetaSheet%', 'Interface_Loop%', 'Binder_Helix%',
                                             'Binder_BetaSheet%', 'Binder_Loop%', 'InterfaceAAs', 'Hotspot_RMSD', 'Target_RMSD']
 
-    def hallucinate(self, design_name: str, length: int, seed: int, helicity_value) -> Any:
+    def hallucinate(self, design_name: str, length: int, seed: int, helicity_value, protocol) -> Any:
         """
         Generate a binder design trajectory.
         Returns metadata including PDB file paths.
@@ -387,9 +389,8 @@ class BinderDesign:
             design_logger.info(f"Starting trajectory: {design_name}")
 
             ### Begin binder hallucination
-            trajectory = binder_hallucination(design_name, self.target_settings["starting_pdb"], self.target_settings["chains"],
-                                                self.target_settings["target_hotspot_residues"], length, seed, helicity_value,
-                                                self.design_models, self.advanced_settings, self.design_paths, self.failure_csv)
+            trajectory = binder_hallucination(design_name, self.target_settings, length, seed, helicity_value,
+                                                self.design_models, self.advanced_settings, self.design_paths, self.failure_csv, protocol)
             # time trajectory
             trajectory_time = time.time() - self.traj_start_time
             self.traj_time_text = f"{'%d hours, %d minutes, %d seconds' % (int(trajectory_time // 3600), int((trajectory_time % 3600) // 60), int(trajectory_time % 60))}"
@@ -755,7 +756,7 @@ class BindCraftPipeline:
             design_logger.debug(f"Sampled trajectory params: name={name}, length={length}, seed={seed}, helicity_value={helicity_value}")
 
             # Design step
-            traj = designer.hallucinate(name, length, seed, helicity_value)
+            traj = designer.hallucinate(name, length, seed, helicity_value, protocol=ws.settings['target_settings']['protocol'])
             if traj is None: # trajectory already exists
                 design_logger.debug(f"Trajectory {name} already exists, skipping to next.")
                 break
@@ -765,12 +766,13 @@ class BindCraftPipeline:
                 "name": name,
                 "length": length,
                 "seed": seed,
+                "protocol": ws.settings['target_settings']['protocol'],
                 "helicity_value": helicity_value,
                 "traj_time_text": designer.traj_time_text,
                 "binder_chain": "B",
                 "prediction_models": self.prediction_models,
                 "mutlimer_validation": self.multimer_validation,
-                "design_models": self.design_models
+                "design_models": self.design_models,
             }
             traj_scorer = Scorer(ws) # refresh scorer.traj_info in every trajectory
 

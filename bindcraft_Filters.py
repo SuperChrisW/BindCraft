@@ -25,7 +25,7 @@ logging.basicConfig(
 )
 
 from bindcraft_module import (
-    Initialization, Workspace, Scorer, BinderDesign, ArtifactHandler, TerminationCriteria, Filter, pr_relax, insert_data
+    Initialization, Workspace, Scorer, BinderDesign, ArtifactHandler, TerminationCriteria, pr_relax, insert_data
 )
 
 class PDBHandler:
@@ -235,7 +235,7 @@ class MPNNHandler:
 
         if ws.advanced_settings["mpnn_fix_interface"]:
             fixed_positions = 'A,' + traj_interface_residues
-            fixed_positions = fixed_positions.rstrip(",")
+            fixed_positions = fixed_positions.rstrip(",") # FIXME: why do we need to remove the last comma?
             print("Fixing interface residues: "+ traj_interface_residues)
         else:
             fixed_positions = 'A'
@@ -317,7 +317,7 @@ class CustomPipeline:
                             help='define the GPU devices')
         args = parser.parse_args()
 
-        os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda
+        #os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda
         return args
     
     def init_pipeline(self, args):
@@ -530,7 +530,7 @@ class CustomPipeline:
 
         # early-stop clash check
         if not pass_af2_filteres or not criteria.quality_check(best_traj, ws.csv_paths["failure_csv"]):
-            logger.info(f"✓ Early stopping: {best_traj} failed quality check")
+            logger.info(f"✓ Early stopping: {best_traj} failed quality check")            
             return False
 
         # Step 2: Relax - Structure optimization
