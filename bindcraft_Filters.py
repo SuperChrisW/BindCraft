@@ -103,6 +103,7 @@ class PDBHandler:
                 'pae': round(prediction_metrics.get('pae',0), 2)
             }
             binder_stats[model_num_to_use+1] = stats
+            # align binder_alone_pdb to traj_pdb
             align_pdbs(traj_pdb, binder_alone_pdb, ws.traj_info["binder_chain"], 'A')
 
         return binder_stats
@@ -543,24 +544,30 @@ class CustomPipeline:
         logger.info(f"Step 2: Scoring relaxed structure")
         traj_metrics = complex_stats[best_key]
         ws.traj_data = scorer.score_traj(binder_seq, best_traj, relaxed_pdb, traj_metrics, ws.traj_info["binder_chain"])
+
+        binder_stats = pdb_handler.predict_binder(binder_seq, ws, best_traj)
+        best_binder_key = max(binder_stats, key=lambda k: complex_stats[k].get('plddt', 0))
+        best_binder_traj = binder_stats[best_binder_key]['output_pdb']
+        # best_binder_traj was aligned to best_traj inside predict_binder
+        binder_stats[best_binder_key]['Binder_RMSD'] = unaligned_rmsd(best_traj, best_binder_traj, ws.traj_info['binder_chain'], 'A')
         
+        # TODO: binder RMSD and Hotspot RMSD:
         #FIXME: for rfdiffusion the binder chain is 'A', while the redesigned chain is 'B'
-        #SKIP for now
         ref_pdb = os.path.join(ws.design_paths['Trajectory'], f"{name}.pdb")
         ws.traj_data['Hotspot_RMSD'] = 0 # delete if issue fixed
         if os.path.exists(ref_pdb):
-            rmsd_site = unaligned_rmsd(ref_pdb, relaxed_pdb, ws.traj_info["binder_chain"], ws.traj_info["binder_chain"])
+            # modify here according to (monomer vs monomer) or (complex vs complex)
+            binder_chain = 'A' # or ws.traj_info['binder_chain']
+            test_pdb = best_binder_traj # best_binder_traj (monomer) or best_traj (complex)
+            align_pdbs(ref_pdb, test_pdb, binder_chain, binder_chain)
+            rmsd_site = unaligned_rmsd(ref_pdb, test_pdb, binder_chain, binder_chain)
             ws.traj_data['Hotspot_RMSD'] = rmsd_site
         else:
             logger.info(f"✓ Reference PDB not found: {ref_pdb}, skip Hotspot_RMSD calculation")
 
         complex_stats[best_key].update(ws.traj_data)
 
-        binder_stats = pdb_handler.predict_binder(binder_seq, ws, best_traj)
-        best_binder_key = max(binder_stats, key=lambda k: complex_stats[k].get('plddt', 0))
-        best_binder_traj = binder_stats[best_binder_key]['output_pdb']
-        binder_stats[best_binder_key]['Binder_RMSD'] = unaligned_rmsd(best_traj, best_binder_traj, ws.traj_info['binder_chain'], 'A')
-
+        # data record
         seq_notes = validate_design_sequence(binder_seq, complex_stats[best_key].get('Relaxed_Clashes', None), ws.advanced_settings)
         
         mpnn_data = [os.path.basename(relaxed_pdb).replace(".pdb", ""), ws.advanced_settings["design_algorithm"], length, ws.traj_info["seed"], ws.traj_info["helicity_value"], 
