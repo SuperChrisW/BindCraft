@@ -11,9 +11,13 @@
 # -a /home/lwang/models/BindCraft/BindCraft_fork/extra_settings/advance_MPNN-FR.json \
 # --cuda 2
 
-python /home/lwang/models/BindCraft/BindCraft_fork/bindcraft_Filters.py \
- -i /home/lwang/models/BindCraft/BindCraft_fork/8OE4_RF_scaffold/traj1/8OE4_XMPNN_selected_slice_1.csv \
- -s /home/lwang/models/BindCraft/BindCraft_fork/8OE4_RF_scaffold/8OE4_scaffold.json \
- -f /home/lwang/models/BindCraft/BindCraft_fork/extra_settings/no_PB_filters.json \
- -a /home/lwang/models/BindCraft/BindCraft_fork/IL23_BC_XMPNN_top300/advance_XMPNN.json \
- --cuda 3
+bindcraft_dir=$1
+CUDA_VISIBLE_DEVICES=$2
+
+cd /mnt/idd_intern/liyao.wang/BindCraft
+python /mnt/idd_intern/liyao.wang/BindCraft/bindcraft_Filters.py \
+ -i ${bindcraft_dir}/XMPNN_redesign_seqs_1.csv \
+ -s ${bindcraft_dir}/IL23_BC_XMPNN.json \
+ -f /mnt/idd_intern/liyao.wang/BindCraft/extra_settings/no_filters.json \
+ -a /mnt/idd_intern/liyao.wang/BindCraft/IL23_BC_traj/IL23_BC_XMPNN/advance_XMPNN.json \
+ --cuda ${CUDA_VISIBLE_DEVICES}
