@@ -559,6 +559,7 @@ class CustomPipeline:
             # modify here according to (monomer vs monomer) or (complex vs complex)
             binder_chain = 'A' # or ws.traj_info['binder_chain']
             test_pdb = best_binder_traj # best_binder_traj (monomer) or best_traj (complex)
+            print(f"aligning {ref_pdb} and {test_pdb}")
             align_pdbs(ref_pdb, test_pdb, binder_chain, binder_chain)
             rmsd_site = unaligned_rmsd(ref_pdb, test_pdb, binder_chain, binder_chain)
             ws.traj_data['Hotspot_RMSD'] = rmsd_site
@@ -624,7 +625,7 @@ def main():
             accepted += 1
             continue
         
-        scorer = pipeline.update_traj_info(ws, name = name, binder_chain='B', length=len(binder_seq))
+        scorer = pipeline.update_traj_info(ws, name = row['design'], binder_chain='B', length=len(binder_seq))
         if pipeline.score_MPNN_designs(binder_seq, mpnn_score, ws, pdb_handler, scorer, criteria):
             accepted += 1
         logger.info(f"Success rate {accepted} / {i+1}")
