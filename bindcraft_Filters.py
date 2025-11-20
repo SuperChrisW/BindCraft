@@ -104,7 +104,7 @@ class PDBHandler:
             }
             binder_stats[model_num_to_use+1] = stats
             # align binder_alone_pdb to traj_pdb
-            align_pdbs(traj_pdb, binder_alone_pdb, ws.traj_info["binder_chain"], 'A')
+            align_pdbs(traj_pdb, binder_alone_pdb, "B", 'A') # binder chain in traj_pdb is 'B', while in binder_alone_pdb is 'A'
 
         return binder_stats
 
@@ -144,7 +144,7 @@ class PDBHandler:
         # 2. Prepare inputs using only the target PDB as a template
         model.prep_inputs(
             pdb_filename=ws.target_settings["starting_pdb"],
-            chain=ws.target_settings["chains"],
+            chain=ws.target_settings["target_chain"] if 'target_chain' in ws.target_settings else ws.target_settings["chains"],
             binder_len=len(binder_seq),
             rm_target_seq=ws.advanced_settings.get("rm_template_seq_predict", False),
             rm_target_sc=ws.advanced_settings.get("rm_template_sc_predict", False)
@@ -270,12 +270,9 @@ class MPNNHandler:
         '''
         BB_df = pd.read_csv(ws.csv_paths["mpnn_bb_score_stats"])
         BB_df['Length'] = BB_df['Sequence'].apply(len)
-        #BB_grouped = BB_df.groupby("Design")["MPNN_score"].mean().reset_index()
-        #BB_grouped_sorted = BB_grouped.sort_values(by="MPNN_score", ascending=True)
-        BB_GS_L50 = BB_df[BB_df["Length"] <= 50].groupby("Design")["MPNN_score"].mean().reset_index()
-        BB_GS_M50 = BB_df[BB_df["Length"] > 50].groupby("Design")["MPNN_score"].mean().reset_index()
-        #top_designs = BB_grouped_sorted.head(top_N)
-        top_designs = pd.concat([BB_GS_L50.head(top_N//2), BB_GS_M50.head(top_N//2)])
+        BB_grouped = BB_df.groupby("Design")["MPNN_score"].mean().reset_index()
+        BB_grouped_sorted = BB_grouped.sort_values(by="MPNN_score", ascending=True)
+        top_designs = BB_grouped_sorted.head(top_N)
 
         representative_designs = BB_df[BB_df["Design"].isin(top_designs["Design"])]
         # For each group, pick the top-ranked entry as the representative design
@@ -318,7 +315,7 @@ class CustomPipeline:
                             help='define the GPU devices')
         args = parser.parse_args()
 
-        #os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda
         return args
     
     def init_pipeline(self, args):
@@ -339,10 +336,7 @@ class CustomPipeline:
         ws.setup()
         ws.init_dataframes()
         
-        # initiate a new bb score csv file
-        #ws.settings["mpnn_bb_labels"] = ['Design', 'MPNN_id', 'Sequence', 'MPNN_score', 'InterfaceResidues']
         ws.csv_paths["final_designs"] = args.input
-        #create_dataframe(ws.csv_paths["mpnn_bb_score_stats"], ws.settings["mpnn_bb_labels"])
         logger.info(f"Workspace setup complete.")
 
         designer = BinderDesign(self.cfg["design_models"], ws.settings, ws.design_paths, ws.csv_paths)
@@ -355,13 +349,14 @@ class CustomPipeline:
 
         return ws, designer, artifact, criteria
     
-    def update_traj_info(self, ws, name, binder_chain, length, seed=0, helicity_value=None, traj_time_text=""):
+    def update_traj_info(self, ws, name, target_chain, binder_chain, length, seed=0, helicity_value=None, traj_time_text=""):
         ws.traj_info = {
             "name": name,
             "length": length,
             "seed": seed,
             "helicity_value": helicity_value,
             "traj_time_text": traj_time_text,
+            "target_chain": target_chain,
             "binder_chain": binder_chain,
             "prediction_models": self.cfg["prediction_models"],
             "multimer_validation": self.cfg["multimer_validation"],
@@ -392,7 +387,7 @@ class CustomPipeline:
         else:
             return None
 
-    def run_PMPNN_redesign(self, pdb_path, ws, designer, pdb_handler, criteria, opt_cycles=1, num_mpnn_sample = 20, binder_chain = 'B'):
+    def run_PMPNN_redesign(self, pdb_path, ws, designer, pdb_handler, criteria, opt_cycles=1, num_mpnn_sample = 20, target_chain="A", binder_chain = 'B'):
         '''
         This function is used to redesign a PDB file using BindCraft pipeline with iterative optimization.
         
@@ -425,7 +420,7 @@ class CustomPipeline:
 
         length = pdb_handler.infer_length_from_pdb(dest_pdb, binder_chain)
         seq = pdb_handler.get_sequence_from_pdb(dest_pdb, binder_chain)
-        scorer = self.update_traj_info(ws, name, binder_chain, length)
+        scorer = self.update_traj_info(ws, name, target_chain, binder_chain, length)
         
         accepted_mpnn = 0
         current_pdb = dest_pdb
@@ -441,7 +436,7 @@ class CustomPipeline:
                 logger.info(f"✓ {current_pdb} passed quality check")
 
             logger.info(f"=== Optimization Cycle {cycle + 1}/{opt_cycles} ===")
-            scorer = self.update_traj_info(ws, f"{name}_cycle{cycle}", binder_chain, length, seed=0, helicity_value=None, traj_time_text=f"Cycle {cycle + 1}")
+            scorer = self.update_traj_info(ws, f"{name}_cycle{cycle}", target_chain, binder_chain, length, seed=0, helicity_value=None, traj_time_text=f"Cycle {cycle + 1}")
 
             # Step 1: Relax - Structure optimization
             relaxed_pdb = os.path.join(ws.design_paths["Trajectory/Relaxed"], f"{name}_cycle{cycle}.pdb")
@@ -509,7 +504,7 @@ class CustomPipeline:
         
         return accepted_mpnn
 
-    def score_MPNN_designs(self, binder_seq, mpnn_score, ws, pdb_handler, scorer, criteria):
+    def score_MPNN_designs(self, binder_seq, ws, pdb_handler, scorer, criteria, mpnn_score=0.0):
         '''
         This function is used to score a sequence using BindCraft pipeline.
         It will:
@@ -545,26 +540,29 @@ class CustomPipeline:
         traj_metrics = complex_stats[best_key]
         ws.traj_data = scorer.score_traj(binder_seq, best_traj, relaxed_pdb, traj_metrics, ws.traj_info["binder_chain"])
 
+        # Binder RMSD: RMSD of the binder chain in apo and bound state
         binder_stats = pdb_handler.predict_binder(binder_seq, ws, best_traj)
         best_binder_key = max(binder_stats, key=lambda k: complex_stats[k].get('plddt', 0))
         best_binder_traj = binder_stats[best_binder_key]['output_pdb']
         # best_binder_traj was aligned to best_traj inside predict_binder
-        binder_stats[best_binder_key]['Binder_RMSD'] = unaligned_rmsd(best_traj, best_binder_traj, ws.traj_info['binder_chain'], 'A')
+        binder_stats[best_binder_key]['Binder_RMSD'] = unaligned_rmsd(best_traj, best_binder_traj, "B", 'A')
         
-        # TODO: binder RMSD and Hotspot RMSD:
-        #FIXME: for rfdiffusion the binder chain is 'A', while the redesigned chain is 'B'
-        ref_pdb = os.path.join(ws.design_paths['Trajectory'], f"{name}.pdb")
-        ws.traj_data['Hotspot_RMSD'] = 0 # delete if issue fixed
-        if os.path.exists(ref_pdb):
-            # modify here according to (monomer vs monomer) or (complex vs complex)
-            binder_chain = 'A' # or ws.traj_info['binder_chain']
-            test_pdb = best_binder_traj # best_binder_traj (monomer) or best_traj (complex)
-            print(f"aligning {ref_pdb} and {test_pdb}")
-            align_pdbs(ref_pdb, test_pdb, binder_chain, binder_chain)
-            rmsd_site = unaligned_rmsd(ref_pdb, test_pdb, binder_chain, binder_chain)
+        # Hotspot RMSD: align the target chains and calculate RMSD on the binder chains
+        # originally designed to compare between trajectory binder and mpnn redesigned binder
+        ref_pdb = ws.target_settings.get('reference_pdb', None)
+        if ref_pdb is not None:
+            ws.traj_data['Hotspot_RMSD'] = 0 # delete if issue fixed
+            if os.path.exists(ref_pdb):
+                # modify here according to (monomer vs monomer) or (complex vs complex)
+                binder_chain = ws.traj_info['binder_chain']
+                target_chain = ws.traj_info['target_chain']
+                test_pdb = best_traj # best_binder_traj (monomer) or best_traj (complex)
+                print(f"aligning {ref_pdb} and {test_pdb}")
+                align_pdbs(ref_pdb, test_pdb, target_chain, "A") #align: 'target_chain' in ref_pdb, "A" in test_pdb
+                rmsd_site = unaligned_rmsd(ref_pdb, test_pdb, binder_chain, "B") #rmsd: 'binder_chain' in ref_pdb, "B" in test_pdb
             ws.traj_data['Hotspot_RMSD'] = rmsd_site
         else:
-            logger.info(f"✓ Reference PDB not found: {ref_pdb}, skip Hotspot_RMSD calculation")
+            logger.info(f"✓ Reference PDB not found in: {rf_pdb_dir}, skip Hotspot_RMSD calculation")
 
         complex_stats[best_key].update(ws.traj_data)
 
@@ -615,23 +613,26 @@ def main():
     accepted = 0
 
     # parse bb_selected.csv
+    binder_chain = ws.target_settings.get('binder_chain', 'B')
+    target_chain = ws.target_settings.get('target_chain', 'A')
     for i, row in design_df.iterrows():
         start_time = time.time()
         logger.info(f"Processing {i+1} / {len(design_df)}")
-        mpnn_score = row['score']
+        mpnn_score = row['score'] if 'score' in design_df.columns else 0.0
         binder_seq = row['seq']
         name = row['design']
         if os.path.exists(os.path.join(ws.design_paths['Accepted'], f'{name}_relaxed.pdb')):
             accepted += 1
             continue
         
-        scorer = pipeline.update_traj_info(ws, name = row['design'], binder_chain='B', length=len(binder_seq))
-        if pipeline.score_MPNN_designs(binder_seq, mpnn_score, ws, pdb_handler, scorer, criteria):
+        # name=row[col_name]- this is used to find the reference monomer/complex PDB file "{name}.pdb" in Trajectory folder for calculating binder chain RMSD
+        scorer = pipeline.update_traj_info(ws, name = row['design'], target_chain=target_chain, binder_chain=binder_chain, length=len(binder_seq))
+        if pipeline.score_MPNN_designs(binder_seq, ws, pdb_handler, scorer, criteria, mpnn_score):
             accepted += 1
         logger.info(f"Success rate {accepted} / {i+1}")
         logger.info(f"Time taken for {name}: {time.time() - start_time:.2f} seconds")
 
-    artifact.rerank_designs()
+    #artifact.rerank_designs() # FIXME: this code leads to error
     pipeline.end_time = time.time()
     logger.info(f"Pipeline complete. Total accepted designs: {accepted} / {len(design_df)}")
     logger.info(f"Total time: {pipeline.end_time - pipeline.pipeline_start_time:.2f} seconds")
