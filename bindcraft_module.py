@@ -110,7 +110,7 @@ class Initialization:
     def run(self) -> Dict[str, Any]:
         # 1. Parse command-line arguments
         args = self.parse_args()
-        os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda
+        #os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda
 
         # 2. Validate input files
         (
@@ -229,6 +229,8 @@ class TerminationCriteria:
 
     def max_trajectories_reached(self, attempted: int) -> bool:
         max_traj = self.advanced.get("max_trajectories", 100)
+        if max_traj is False or max_traj <= 0:
+            return False
         return attempted >= max_traj
     
     def pdb_final_designs_reached(self, design_paths: Dict[str, str], target_settings: Dict[str, Any]) -> bool:
@@ -265,7 +267,6 @@ class TerminationCriteria:
                 logger.info("Too few contacts at the interface, skipping analysis and MPNN optimisation")
                 return False
             else:
-                # phew, trajectory is okay! We can continue
                 return True
 
 class Scorer:
@@ -287,19 +288,17 @@ class Scorer:
         # secondary structure content of starting trajectory binder and interface
         traj_alpha, traj_beta, traj_loops, traj_alpha_interface, traj_beta_interface, \
             traj_loops_interface, traj_i_plddt, traj_ss_plddt = \
-            calc_ss_percentage(traj_pdb, self.advanced_settings, binder_chain)
+            calc_ss_percentage(traj_pdb, self.advanced_settings, chain_id="B") #binder chain is always B in hallucination
 
         # analyze interface scores for relaxed af2 trajectory
-        traj_interface_scores, traj_interface_AA, traj_interface_residues = score_interface(traj_relaxed, binder_chain)
-
-        # starting binder sequence
-        #traj_seq = traj.get_seq(get_best=True)[0]
+        traj_interface_scores, traj_interface_AA, traj_interface_residues = score_interface(traj_relaxed, binder_chain="B")
 
         # analyze sequence
         traj_seq_notes = validate_design_sequence(traj_seq, num_clashes_relaxed, self.advanced_settings)
 
         # target structure RMSD compared to input PDB
-        traj_target_rmsd = target_pdb_rmsd(traj_pdb, self.target_settings["starting_pdb"], self.target_settings["chains"])
+        target_chain = self.target_settings.get("target_chain", self.target_settings.get("chains", "A"))
+        traj_target_rmsd = target_pdb_rmsd(traj_pdb, self.target_settings["starting_pdb"], target_chain) # inside function default set traj_pdb target chain to "A"
 
         return {
                 "design_name": self.traj_info["name"],
@@ -388,9 +387,8 @@ class BinderDesign:
         if not trajectory_exists:
             design_logger.info(f"Starting trajectory: {design_name}")
 
-            ### Begin binder hallucination
-            trajectory = binder_hallucination(design_name, self.target_settings, length, seed, helicity_value,
-                                                self.design_models, self.advanced_settings, self.design_paths, self.failure_csv, protocol)
+            ### Begin binder hallucination design_name, starting_pdb, chain, target_hotspot_residues, length, seed, helicity_value, design_models, advanced_settings, design_paths, failure_csv
+            trajectory = binder_hallucination(design_name, self.target_settings, length, seed, helicity_value, self.design_models, self.advanced_settings, self.design_paths, self.failure_csv)
             # time trajectory
             trajectory_time = time.time() - self.traj_start_time
             self.traj_time_text = f"{'%d hours, %d minutes, %d seconds' % (int(trajectory_time // 3600), int((trajectory_time % 3600) // 60), int(trajectory_time % 60))}"
@@ -632,21 +630,6 @@ class BinderDesign:
         binder_prediction_model.prep_inputs(length=ws.traj_info["length"])
         
         return complex_prediction_model, binder_prediction_model
-    
-    def rfdiffusion_design(self, mpnn_data, design_labels, filters):
-        raise NotImplementedError("RFdiffusion design not implemented yet")
-    
-    def dlpm_design(self, mpnn_data, design_labels, filters):
-        raise NotImplementedError("DLPM design not implemented yet")
-    
-    def hallucinate_scaffolding(self, mpnn_data, design_labels, filters):
-        raise NotImplementedError("Scaffolding design not implemented yet")
-
-    def rfdiffusion_scaffolding(self, mpnn_data, design_labels, filters):
-        raise NotImplementedError("RFdiffusion scaffolding design not implemented yet")
-    
-    def dlpm_scaffolding(self, mpnn_data, design_labels, filters):
-        raise NotImplementedError("DLPM scaffolding design not implemented yet")
 
 class ArtifactHandler:
     def __init__(self, design_paths: Dict[str, str], settings: Dict[str, Any], csv_paths: Dict[str, str]) -> None:
@@ -738,7 +721,7 @@ class BindCraftPipeline:
 
         # Main Loop
         while True:
-            design_logger.debug(f"Trajectory loop: trajectory_n={self.trajectory_n}, accepted={self.accepted}")
+            design_logger.info(f"Trajectory loop: trajectory_n={self.trajectory_n}, accepted={self.accepted}")
 
             if criteria.pdb_final_designs_reached(ws.design_paths, ws.settings['target_settings']):
                 design_logger.debug("Final designs reached, reranking and exiting loop.")
