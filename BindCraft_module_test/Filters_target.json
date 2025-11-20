@@ -1,0 +1,11 @@
+{
+    "protocol": "binder",
+    "design_path": "./Filters",
+    "binder_name": "binder",
+    "starting_pdb": "./5mj4_fixed.pdb",
+    "reference_pdb": null,
+    "target_chain": "B",
+    "binder_chain": "C",
+    "target_hotspot_residues": null,
+    "number_of_final_designs": 2
+}

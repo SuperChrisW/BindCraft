@@ -1,0 +1,10 @@
+{
+    "protocol": "binder",
+    "design_path": "./binder",
+    "binder_name": "binder",
+    "starting_pdb": "./PDL1.pdb",
+    "chains": "B",
+    "target_hotspot_residues": null,
+    "lengths": [30,50],
+    "number_of_final_designs": 2
+}
